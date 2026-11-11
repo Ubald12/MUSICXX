@@ -1462,7 +1462,9 @@ if __name__ == "__main__":
         sys.exit()
     if self_update():  # restart on the new code
         server.server_close()
-        subprocess.Popen([sys.executable, str(Path(__file__).resolve())], env={**os.environ, "MUSICXX_UPDATED": "1"})
+        launcher = Path(__file__).with_name("mac_launch.sh")  # keeps the "MUSICXX" Dock name on a Mac
+        subprocess.Popen(["/bin/sh", str(launcher)] if sys.platform == "darwin" and launcher.is_file() else
+                         [sys.executable, str(Path(__file__).resolve())], env={**os.environ, "MUSICXX_UPDATED": "1"})
         sys.exit()
     for task in (analyzer, syncer, clipboard_watcher, update_tools, watch_busy):
         threading.Thread(target=task, daemon=True).start()

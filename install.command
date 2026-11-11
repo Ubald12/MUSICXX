@@ -19,7 +19,7 @@ fi
 echo "== Using $("$PY" --version)"
 
 mkdir -p "$DIR/app"
-cp musicxx.py analyze.py logo.png "$DIR/app/"
+cp musicxx.py analyze.py logo.png MUSICXX.icns mac_launch.sh "$DIR/app/"
 "$PY" -m venv "$DIR/venv"
 V="$DIR/venv/bin"
 "$V/python" -m pip install -q --upgrade pip
@@ -35,7 +35,8 @@ if [ "$(uname)" = Darwin ]; then
   # "allow access to Desktop" prompt, which MUSICXX needs to save into Desktop/OK.
   APP="$HOME/Applications/MUSICXX.app"
   mkdir -p "$HOME/Applications"; rm -rf "$APP"
-  osacompile -o "$APP" -e "do shell script \"'$V/python' '$DIR/app/musicxx.py' >/dev/null 2>&1 &\""
+  # mac_launch.sh runs MUSICXX inside its own bundle, so the Dock says "MUSICXX", not "Python"
+  osacompile -o "$APP" -e "do shell script \"/bin/sh '$DIR/app/mac_launch.sh' >/dev/null 2>&1 &\""
   cp MUSICXX.icns "$APP/Contents/Resources/applet.icns"
   plutil -replace NSMicrophoneUsageDescription -string "MUSICXX listens to identify the song that's playing." "$APP/Contents/Info.plist"
   codesign --force --deep -s - "$APP" 2>/dev/null || true
