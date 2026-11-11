@@ -41,9 +41,10 @@ When it finishes, MUSICXX opens in your web browser, and a **MUSICXX** shortcut 
 - **Locked SoundCloud tracks:** big-label tracks on SoundCloud are locked, so MUSICXX gets those from YouTube Music too.
 - **BPM is an estimate.** Hip-hop sometimes reads at half or double the usual tempo.
 - **Key and BPM on Windows:** the analysis library has no Windows version, so Windows shows only the genre.
-- **If downloads stop working,** run the installer again. That updates the download tools.
 - **Use it only for music you're allowed to download.**
 
 ## Updating
 
-Download the ZIP again and run the installer. Your downloaded songs in Desktop/OK aren't touched.
+MUSICXX updates itself. Each time you open it, it gets the latest version from this page. Your songs in Desktop/OK aren't touched.
+
+If downloads stop working, run the installer again. That also updates the download tools.
