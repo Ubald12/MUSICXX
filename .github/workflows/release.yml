@@ -1,0 +1,46 @@
+# Builds the one-file installers (Mac .dmg for Apple Silicon and Intel, Windows .exe) and publishes them as a
+# GitHub release. Runs when a version tag like v2.0.0 is pushed, or by hand from the Actions tab.
+name: Release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  mac:
+    strategy:
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash packaging/build_mac.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}
+          path: dist/*.dmg
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: powershell -ExecutionPolicy Bypass -File packaging/build_windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*.exe
+  publish:
+    needs: [mac, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="$GITHUB_REF_NAME"; [ "$GITHUB_REF_TYPE" = tag ] || TAG="v$(date +%Y.%m.%d)"
+          NOTES="Mac with Apple chip (M1 or newer): MUSICXX-mac-arm64.dmg · Older Intel Mac: MUSICXX-mac-intel.dmg · Windows: MUSICXX-Setup-Windows.exe"
+          gh release create "$TAG" out/* --repo "$GITHUB_REPOSITORY" --title "MUSICXX $TAG" --notes "$NOTES" \
+            || gh release upload "$TAG" out/* --clobber --repo "$GITHUB_REPOSITORY"

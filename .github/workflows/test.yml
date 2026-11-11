@@ -1,0 +1,22 @@
+# Runs the real installers and MUSICXX's self-test on Windows, Mac and Linux after every change.
+name: Test
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install and self-test (Mac / Linux)
+        if: runner.os != 'Windows'
+        run: bash install.command
+      - name: Install and self-test (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: install.bat
