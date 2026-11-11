@@ -8,7 +8,10 @@ Paste a Spotify, YouTube or SoundCloud link and get the song as a **.wav** file 
 - **🔎 Explore:** search Spotify, YouTube or SoundCloud inside the app, play songs before you download, and filter SoundCloud results by edits, remixes, bootlegs, mashups and sped-up versions.
 - **🎙 Listen:** like Shazam. Play a song near your computer, and MUSICXX recognizes it and downloads it.
 - **🔥 Charts:** the top 100 trending R&B, Afrobeats and US Rap songs, with download-all.
-- **🎹 Key, BPM and genre** for every song you download, including the Camelot code for harmonic mixing.
+- **🎹 Key, BPM, genre and cover art** for every song, including the Camelot code for harmonic mixing, written inside the file so DJ software (Rekordbox, Serato) and music players show it.
+- **📚 Library:** every song in your folder, searchable and sortable by key, BPM, genre or date, with a built-in player.
+- **🔁 Synced playlists:** tick **Keep synced** on a downloaded playlist and new songs added to it download automatically.
+- **📋 Copy a link anywhere** and MUSICXX offers to download it.
 
 Works on **Windows 10/11, macOS and Linux** computers. It doesn't work on phones (iPhone or Android), because they can't run the download tools.
 
@@ -25,7 +28,7 @@ Works on **Windows 10/11, macOS and Linux** computers. It doesn't work on phones
    - **Linux:** open a terminal in the folder and run `bash install.command`.
 3. **Wait** about 2–5 minutes while it downloads the music tools.
 
-When it finishes, MUSICXX opens in your web browser, and a **MUSICXX** shortcut appears on your Desktop. On Mac it's also in Launchpad. Start it from that shortcut from now on. You can delete the unzipped folder.
+When it finishes, MUSICXX opens in its own window, and a **MUSICXX** shortcut appears on your Desktop. On Mac it's also in Launchpad. Start it from that shortcut from now on. You can delete the unzipped folder.
 
 **First download on a Mac:** macOS may ask whether MUSICXX can access your Desktop. Click **Allow**, or songs can't be saved.
 
@@ -35,7 +38,10 @@ When it finishes, MUSICXX opens in your web browser, and a **MUSICXX** shortcut 
 - **Explore:** choose a platform, search, and press ▶ to listen or ↓ to download.
 - **Listen:** click **Listen** and allow the microphone. After about 11 seconds, the song is found and downloaded.
 - **Charts:** choose a genre, then download one song or all 100.
-- **Stop MUSICXX:** click **⏻ Quit** at the top right of the page.
+- **Library:** search your songs, click a column to sort, ▶ to play.
+- **Cancel or retry:** click ✕ on a running download, or **Retry** on one that failed.
+- **⚙️ Settings:** choose where songs save, the file format (WAV, AIFF, FLAC or MP3), and turn the clipboard offer on or off.
+- **Stop MUSICXX:** close the window, or click **Quit**.
 
 ## Things to know
 
@@ -49,4 +55,4 @@ When it finishes, MUSICXX opens in your web browser, and a **MUSICXX** shortcut 
 
 MUSICXX updates itself. Each time you open it, it gets the latest version from this page. Your songs in Desktop/OK aren't touched.
 
-If downloads stop working, run the installer again. That also updates the download tools.
+The download tools (yt-dlp and spotdl) also update themselves once a day, so downloads keep working when YouTube or Spotify change.

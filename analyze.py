@@ -16,9 +16,22 @@ def camelot(key, scale):
     return f"{n}{'A' if scale == 'minor' else 'B'}"
 
 
+def fold(bpm):
+    """Half / double into 70-180, the range DJ software shows."""
+    while bpm < 70:
+        bpm *= 2
+    while bpm > 180:
+        bpm /= 2
+    return bpm
+
+
 if __name__ == "__main__":
     audio = es.MonoLoader(filename=sys.argv[1], sampleRate=44100)()
-    bpm = es.RhythmExtractor2013(method="multifeature")(audio)[0]
+    bpm, _, confidence, _, _ = es.RhythmExtractor2013(method="multifeature")(audio)
+    if confidence < 1.5:  # unsure (triplet hi-hats fool it by 3:2 or 4:3): a second, different estimator decides
+        other = es.PercivalBpmEstimator()(audio)
+        bpm = other if abs(other - bpm) / bpm > 0.03 else bpm
+    bpm = fold(bpm)
     key, scale, _ = es.KeyExtractor(profileType="edma")(audio)  # "edma" profile is tuned for modern electronic/pop
-    assert camelot("C", "major") == "8B" and camelot("A", "minor") == "8A" and camelot("E", "major") == "12B"
+    assert camelot("C", "major") == "8B" and camelot("A", "minor") == "8A" and camelot("E", "major") == "12B" and fold(65) == 130 and fold(190) == 95
     print(json.dumps({"bpm": round(bpm), "key": f"{key} {scale}", "camelot": camelot(key, scale)}))

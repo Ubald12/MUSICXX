@@ -2,3 +2,4 @@ yt-dlp[default]
 deno
 spotdl
 shazamio
+mutagen

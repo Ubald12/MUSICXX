@@ -26,6 +26,8 @@ set "V=%DIR%\venv\Scripts"
 "%V%\python.exe" -m pip install -q --upgrade pip
 echo == Downloading the music tools (takes a minute or two)...
 "%V%\python.exe" -m pip install -q -r requirements.txt || goto fail
+rem Own app window (needs Microsoft WebView2, built into Windows 10/11). Optional: falls back to the browser.
+"%V%\python.exe" -m pip install -q pywebview || echo    (MUSICXX will open in your browser instead of its own window)
 rem ffmpeg converts audio to .wav; spotdl fetches a copy into %USERPROFILE%\.spotdl, which MUSICXX looks in
 where ffmpeg >nul 2>nul || if not exist "%USERPROFILE%\.spotdl\ffmpeg.exe" "%V%\spotdl.exe" --download-ffmpeg
 

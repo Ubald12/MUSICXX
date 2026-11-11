@@ -26,6 +26,7 @@ V="$DIR/venv/bin"
 echo "== Downloading the music tools (takes a minute or two)…"
 "$V/python" -m pip install -q -r requirements.txt
 "$V/python" -m pip install -q essentia 2>/dev/null || echo "   (key/BPM analysis isn't available for this Python; everything else works)"
+[ "$(uname)" = Darwin ] && { "$V/python" -m pip install -q pywebview 2>/dev/null || echo "   (MUSICXX will open in your browser instead of its own window)"; }
 # ffmpeg converts audio to .wav; spotdl fetches a copy into ~/.spotdl, which MUSICXX looks in
 command -v ffmpeg >/dev/null || [ -x "$HOME/.spotdl/ffmpeg" ] || "$V/spotdl" --download-ffmpeg
 
@@ -36,6 +37,7 @@ if [ "$(uname)" = Darwin ]; then
   mkdir -p "$HOME/Applications"; rm -rf "$APP"
   osacompile -o "$APP" -e "do shell script \"'$V/python' '$DIR/app/musicxx.py' >/dev/null 2>&1 &\""
   cp MUSICXX.icns "$APP/Contents/Resources/applet.icns"
+  plutil -replace NSMicrophoneUsageDescription -string "MUSICXX listens to identify the song that's playing." "$APP/Contents/Info.plist"
   codesign --force --deep -s - "$APP" 2>/dev/null || true
   touch "$APP"
   NAME="MUSICXX"; [ -e "$HOME/Desktop/$NAME" ] && NAME="MUSICXX App"  # never touch an existing file/folder
