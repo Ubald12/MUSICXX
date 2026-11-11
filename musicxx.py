@@ -712,7 +712,7 @@ setInterval(poll,1000);poll();t.focus();if(location.hash=='#charts')tab('charts'
 </script></body></html>"""
 
 
-UPDATE_URL = "https://raw.githubusercontent.com/Ubald12/MUSICXX/main/"
+REPO = "Ubald12/MUSICXX"
 
 
 def self_update():
@@ -721,9 +721,14 @@ def self_update():
     here = Path(__file__).resolve().parent
     if (here / ".git").exists() or os.environ.get("MUSICXX_UPDATED"):
         return False
+    # Fetch by commit id: raw.githubusercontent caches /main/ for 5 minutes and could hand back an older version
+    sha = subprocess.run(["curl", "-sf", "--max-time", "10", "-H", "Accept: application/vnd.github.sha",
+                          f"https://api.github.com/repos/{REPO}/commits/main"], capture_output=True, text=True).stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        return False  # offline or rate-limited: run what we have
     changed = False
     for name in ("musicxx.py", "analyze.py"):
-        new = fetch(UPDATE_URL + name)
+        new = fetch(f"https://raw.githubusercontent.com/{REPO}/{sha}/{name}")
         try:
             compile(new, name, "exec")  # never install a truncated or broken download
         except (SyntaxError, ValueError):
