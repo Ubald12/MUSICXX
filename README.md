@@ -16,7 +16,11 @@ Works on **Windows 10/11, macOS and Linux** computers. It doesn't work on phones
 1. **Download:** [MUSICXX ZIP](https://github.com/Ubald12/MUSICXX/archive/refs/heads/main.zip), or use the green **Code** button, then **Download ZIP**. Unzip it.
 2. **Run the installer** in the unzipped folder:
    - **Windows:** double-click **`install.bat`**. If Windows shows *"Windows protected your PC"*, click **More info**, then **Run anyway**. If Python isn't installed yet, the installer installs it for you.
-   - **Mac:** right-click **`install.command`** and choose **Open**, then **Open** again. Double-clicking won't work the first time, because the file isn't from the App Store. If it says you need Python, install it from [python.org](https://www.python.org/downloads/) and run the installer again.
+   - **Mac:** use **`install.command`**. (`install.bat` is the Windows installer, so ignore it on a Mac.)
+     1. Double-click **`install.command`**. macOS says it can't check the file for malware, because it isn't from the App Store. Click **Done**.
+     2. Open **System Settings**, then **Privacy & Security**, and scroll to the bottom. Next to *"install.command was blocked"*, click **Open Anyway**, then **Open Anyway** again and enter your Mac password.
+
+     If it says you need Python, install it from [python.org](https://www.python.org/downloads/) and run the installer again.
    - **Linux:** open a terminal in the folder and run `bash install.command`.
 3. **Wait** about 2–5 minutes while it downloads the music tools.
 
