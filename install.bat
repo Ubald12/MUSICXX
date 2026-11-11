@@ -31,6 +31,9 @@ rem Own app window (needs Microsoft WebView2, built into Windows 10/11). Optiona
 rem ffmpeg converts audio to .wav; spotdl fetches a copy into %USERPROFILE%\.spotdl, which MUSICXX looks in
 where ffmpeg >nul 2>nul || if not exist "%USERPROFILE%\.spotdl\ffmpeg.exe" "%V%\spotdl.exe" --download-ffmpeg
 
+rem Automated test run (GitHub Actions): check the install works, skip shortcuts
+if defined CI goto citest
+
 rem Desktop + Start menu shortcuts. pythonw = no console window; use the Quit button in MUSICXX to stop it.
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$w = New-Object -ComObject WScript.Shell;" ^
@@ -47,16 +50,20 @@ start "" "%V%\pythonw.exe" "%DIR%\app\musicxx.py"
 pause
 exit /b 0
 
+:citest
+"%V%\python.exe" "%DIR%\app\musicxx.py" --test
+exit /b %errorlevel%
+
 :nopython
 echo.
 echo Couldn't install Python automatically. Get Python 3.12 from https://www.python.org/downloads/
 echo (tick "Add python.exe to PATH" during setup), then run this installer again.
 start "" https://www.python.org/downloads/
-pause
+if not defined CI pause
 exit /b 1
 
 :fail
 echo.
 echo Something went wrong (see the messages above). Check your internet connection and run the installer again.
-pause
+if not defined CI pause
 exit /b 1

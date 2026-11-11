@@ -30,6 +30,10 @@ echo "== Downloading the music tools (takes a minute or two)…"
 # ffmpeg converts audio to .wav; spotdl fetches a copy into ~/.spotdl, which MUSICXX looks in
 command -v ffmpeg >/dev/null || [ -x "$HOME/.spotdl/ffmpeg" ] || "$V/spotdl" --download-ffmpeg
 
+if [ -n "$CI" ]; then  # automated test run (GitHub Actions): check the install works, skip shortcuts
+  "$V/python" "$DIR/app/musicxx.py" --test; exit
+fi
+
 if [ "$(uname)" = Darwin ]; then
   # A real app with the logo, plus an alias on the Desktop. An AppleScript applet gets macOS's normal
   # "allow access to Desktop" prompt, which MUSICXX needs to save into Desktop/OK.

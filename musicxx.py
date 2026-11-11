@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """MUSICXX: a local chat bot. Paste Spotify / YouTube / SoundCloud links (songs or playlists),
 get .wav files in Desktop/OK. Run: python3 musicxx.py   (self-check: python3 musicxx.py --test)"""
-import base64, csv, glob, html, importlib.util, io, itertools, json, os, queue, re, signal, subprocess, sys, tempfile, threading, time, webbrowser
+import base64, csv, glob, hmac, html, importlib.util, io, itertools, json, os, queue, re, secrets, signal, socket, subprocess, sys, tempfile, threading, time, webbrowser
+from urllib.parse import quote
+from xml.sax.saxutils import escape, quoteattr
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qs, quote_plus, urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -38,7 +40,19 @@ LOGO = Path(__file__).with_name("logo.png")
 os.environ["PATH"] = os.pathsep.join([str(Path(sys.executable).parent), str(Path.home() / ".spotdl"),
                                       f"{Path.home()}/.local/bin", "/opt/homebrew/bin", "/usr/local/bin",
                                       os.environ.get("PATH", "")])
-os.environ.update(NO_COLOR="1", TERM="dumb", PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+# the packaged app keeps ffmpeg and its tools in its own Python folder
+os.environ["PATH"] = os.pathsep.join([str(Path(sys.prefix)), str(Path(sys.prefix) / "bin"), str(Path(sys.prefix) / "Scripts"), os.environ["PATH"]])
+# COLUMNS: spotdl's logger wraps at 80 characters without it, which splits the lines we read
+os.environ.update(NO_COLOR="1", TERM="dumb", PYTHONUTF8="1", PYTHONIOENCODING="utf-8", COLUMNS="1000")
+BUNDLED = (Path(sys.prefix) / "MUSICXX_BUNDLED").exists()  # the one-file installers' private Python
+OWN_PYTHON = BUNDLED or sys.prefix != sys.base_prefix     # ours to pip-install into (never a system Python)
+# packaged Mac app: macOS may stop an app rewriting its own bundle, so libraries and updates go to the user's folder
+PIP_USER = ["--user"] if BUNDLED and sys.platform == "darwin" else []
+
+
+def tool(module, script):
+    """Run a Python tool as `python -m module` when this Python has it, else its command-line script."""
+    return [sys.executable, "-m", module] if importlib.util.find_spec(module) else [script]
 
 
 def tool_python(module, fallback):
@@ -51,15 +65,15 @@ def ensure(module, package=None):
     installed into the installer's venv (never into a system Python)."""
     if importlib.util.find_spec(module):
         return True
-    if sys.prefix == sys.base_prefix:
+    if not OWN_PYTHON:
         return False
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", package or module], capture_output=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", *PIP_USER, package or module], capture_output=True)
     importlib.invalidate_caches()
     return importlib.util.find_spec(module) is not None
 
 
 jobs, ids = [], itertools.count(1)
-PRIVATE = ("cmd", "retry", "proc", "before")  # job fields the page never sees
+PRIVATE = ("cmd", "retry", "proc", "before", "pre", "isrc_urls", "scores", "matches")  # job fields the page never sees
 
 
 CHARTS = {  # key: (name, Shazam chart CSVs, merged in order). Shazam updates these weekly.
@@ -145,7 +159,7 @@ def search(platform, q):
     terms = (["ytsearch20:" + q] if platform == "youtube" else
              ["scsearch40:" + q, f"scsearch25:{q} edit", f"scsearch25:{q} remix"])
     with ThreadPoolExecutor(len(terms)) as pool:
-        runs = pool.map(lambda t: subprocess.run(["yt-dlp", "--flat-playlist", "-J", t],
+        runs = pool.map(lambda t: subprocess.run([*tool("yt_dlp", "yt-dlp"), "--flat-playlist", "-J", t],
                                                  capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=40).stdout, terms)
         entries = [e for out in runs for e in (json.loads(out or "{}").get("entries") or [])]
     out, seen = [], set()
@@ -174,8 +188,9 @@ def dl_format():
 def spotdl(*queries, archive=None):
     """spotdl takes Spotify links or plain "Artist - Title" searches."""
     fmt = dl_format()
-    return ["spotdl", "download", *queries, "--format", fmt, *(["--bitrate", "320k"] if fmt == "mp3" else []),
-            "--simple-tui", *(["--archive", str(archive)] if archive else []),
+    # DEBUG log: shows whether spotdl matched the song by its recording code (ISRC) or by a best guess
+    return [*tool("spotdl", "spotdl"), "download", *queries, "--format", fmt, *(["--bitrate", "320k"] if fmt == "mp3" else []),
+            "--simple-tui", "--log-level", "DEBUG", *(["--archive", str(archive)] if archive else []),
             "--output", f"{OUT}/{{artists}} - {{title}}.{{output-ext}}"]
 
 
@@ -188,9 +203,12 @@ def command(url):
     return None
 
 
-def ytdlp(url, name="%(uploader)s - %(title)s", *extra):
+YT_NAME = "%(artist,creator,uploader)s - %(track,title)s"
+
+
+def ytdlp(url, name=YT_NAME, *extra):
     # --no-playlist: a song link that also carries &list= grabs only the song; pure playlist/set links still get everything
-    return ["yt-dlp", "-x", "--audio-format", dl_format(), *(["--audio-quality", "0"] if dl_format() == "mp3" else []), "--no-playlist", "--newline", "--ignore-errors",
+    return [*tool("yt_dlp", "yt-dlp"), "-x", "--audio-format", dl_format(), *(["--audio-quality", "0"] if dl_format() == "mp3" else []), "--no-playlist", "--newline", "--ignore-errors",
             "-P", str(OUT), "-o", f"{name}.%(ext)s", *extra, url]
 
 
@@ -232,18 +250,38 @@ def ytmusic(artist, title):
 
 SONG = re.compile(r'\[ExtractAudio\] Destination: (.+)|Downloaded "(.+)":|Skipping (.+) \(file already exists\)')
 TOTAL = re.compile(r"Downloading item \d+ of (\d+)|^\d+/(\d+) complete")
-PCT = re.compile(r"^\[download\]\s+([\d.]+)%")
+PCT = re.compile(r"^\[download\]\s+([\d.]+)%|(\d+(?:\.\d+)?)%\|")  # yt-dlp, or a tqdm bar (stem separation)
+ISRC = re.compile(r"Returning only ISRC result (\S+)|Best ISRC result is (\S+)")
+USING = re.compile(r"Downloading (.+) using (\S+)")
+SCORE = re.compile(r"Returning best result (\S+) with score ([\d.]+)")
+LISTNAME = re.compile(r"Found \d+ songs in (.+) \((?:Playlist|Album)\)|\[download\] Downloading playlist: (.+)")
+FORMAT = re.compile(r"Downloading 1 format\(s\): (\S+)")
+# what YouTube / SoundCloud actually serve; a WAV can't be better than this
+SOURCE_KBPS = {"251": 160, "250": 70, "249": 50, "140": 128, "141": 256, "774": 256, "http_mp3_128": 128,
+               "hls_mp3_128": 128, "hls_aac_160": 160, "hls_opus_64": 64, "http_mp3_1_0": 128}
 
 
 def parse(job, line):
-    """Update a job's progress from one line of yt-dlp / spotdl output."""
-    job["log"] = line[-300:]
+    """Update a job's progress from one line of yt-dlp / spotdl / demucs output."""
+    if " DEBUG " not in line[:40]:  # spotdl's debug lines are for us, not for the progress text
+        job["log"] = line[-300:]
     m = TOTAL.search(line)
     if m:
         job["total"] = int(m.group(1) or m.group(2))
     m = PCT.search(line)
     if m:
-        job["pct"] = float(m.group(1))
+        job["pct"] = float(m.group(1) or m.group(2))
+    if (m := LISTNAME.search(line)) and not job.get("fallback"):  # a YouTube Music search is a "playlist" too
+        job["playlist"] = (m.group(1) or m.group(2)).strip()
+    if m := FORMAT.search(line):
+        job["kbps"] = SOURCE_KBPS.get(m.group(1).split("+")[0], job.get("kbps"))
+    if m := ISRC.search(line):
+        job.setdefault("isrc_urls", set()).add(m.group(1) or m.group(2))
+    elif m := SCORE.search(line):
+        job.setdefault("scores", {})[m.group(1)] = round(float(m.group(2)))
+    elif m := USING.search(line):  # remembered until spotdl reports the song finished
+        url = m.group(2)
+        job.setdefault("matches", {})[m.group(1)] = "exact" if url in job.get("isrc_urls", ()) else job.get("scores", {}).get(url)
     m = SONG.search(line)  # spotdl "already exists" counts too, so a re-sent playlist doesn't report "0 saved"
     if m:
         name = Path(m.group(1)).stem if m.group(1) else m.group(2) or m.group(3)
@@ -265,7 +303,9 @@ def set_info(job, name, **values):
 
 
 def queue_analysis(job, name, path):
-    set_info(job, name, state="queued")
+    # spotdl: "exact" (same recording code) or a 0-100 guess score; the YouTube Music fallback is always a guess
+    match = job.get("matches", {}).get(name, "search" if job.get("fallback") else None)
+    set_info(job, name, state="queued", **({"match": match} if match is not None else {}))
     analysis.put((job, name, path))
 
 
@@ -310,7 +350,7 @@ def write_tags(f, info):
         return
     import mutagen
     from mutagen.flac import FLAC, Picture
-    from mutagen.id3 import APIC, COMM, TALB, TBPM, TCON, TDRC, TIT2, TKEY, TPE1
+    from mutagen.id3 import APIC, COMM, TALB, TBPM, TCON, TDRC, TIT2, TKEY, TPE1, TXXX
     artist, title = (f.stem.split(" - ", 1) + [""])[:2] if " - " in f.stem else ("", f.stem)
     key, bpm = short_key(info.get("key", "")), str(info.get("bpm") or "")
     cover = fetch(info["cover"], raw=True) if info.get("cover") else b""
@@ -322,6 +362,8 @@ def write_tags(f, info):
                      "date": info.get("year"), "bpm": bpm, "initialkey": key}.items():
             if v:
                 audio[k] = v
+        if info.get("lufs") is not None:
+            audio["replaygain_track_gain"] = f"{-18 - info['lufs']:.2f} dB"
         if cover:
             pic = Picture()
             pic.type, pic.mime, pic.data = 3, "image/jpeg", cover
@@ -336,6 +378,8 @@ def write_tags(f, info):
                 audio.tags.add(frame(encoding=3, text=v))
         if info.get("camelot"):  # Mixed In Key style, shown in the comment column of most DJ apps
             audio.tags.add(COMM(encoding=3, lang="eng", desc="", text=f"{info['camelot']} - {info['key']} - {bpm} BPM"))
+        if info.get("lufs") is not None:  # players that honour ReplayGain play every song at the same loudness
+            audio.tags.add(TXXX(encoding=3, desc="REPLAYGAIN_TRACK_GAIN", text=f"{-18 - info['lufs']:.2f} dB"))
         if cover:
             audio.tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=cover))
     audio.save()
@@ -351,6 +395,58 @@ def to_aiff(f):
     return f
 
 
+JUNK = re.compile(r"\s*[(\[](?:official\s*)?(?:music\s*|lyrics?\s*)?(?:video|audio|visuali[sz]er|vizuali[sz]er|"
+                  r"clip(?:\s*officiel)?|lyrics?|hd|hq|4k|explicit)(?:\s*video)?[)\]]", re.I)
+
+
+def clean_name(stem):
+    """"Luis Fonsi - Luis Fonsi - Despacito" / "Gradur - GRADUR - DÉCENNIE (VIZUALISER)" -> "Artist - Title"."""
+    artist, sep, title = stem.partition(" - ")
+    if not sep:
+        return JUNK.sub("", stem).strip() or stem
+    title = JUNK.sub("", title).strip()
+    for prefix in (artist + " - ", "Topic - "):  # channel name repeated in the video title, YouTube "Artist - Topic"
+        if title.lower().startswith(prefix.lower()):
+            title = title[len(prefix):].strip()
+    return f"{artist} - {title}" if title else stem
+
+
+def song_key(stem):
+    """Same song regardless of features, brackets, case and punctuation: used to spot duplicates."""
+    artist, _, title = stem.partition(" - ")
+    title = re.sub(r"[(\[].*?[)\]]|\bfeat\..*", "", title or artist)
+    return re.sub(r"\W+", "", re.split(r",|&| x | feat", artist)[0].lower()) + "|" + re.sub(r"\W+", "", title.lower())
+
+
+def rename_song(job, old, new):
+    with info_lock:
+        job["songs"] = [new if s == old else s for s in job["songs"]]
+        info = dict(job["info"])
+        if old in info:
+            info[new] = info.pop(old)
+        job["info"] = info
+    for files in playlists.values():
+        files[:] = [new if s == old else s for s in files]
+
+
+def tidy(job, name, f):
+    """Clean a new download's file name, and drop it if the same song is already in the folder (in any format).
+    Only touches files this job created. Returns (file, name) to use from now on."""
+    if f.name in job.get("before", ()):
+        return f, name
+    clean = clean_name(f.stem)
+    twin = next((o for o in (OUT / (clean + e) for e in AUDIO) if o != f and o.is_file()), None)
+    if twin:
+        f.unlink()
+        f = twin
+        set_info(job, name, duplicate=True)
+    elif clean != f.stem:
+        f = f.rename(f.with_name(clean + f.suffix))
+    if clean != name:
+        rename_song(job, name, clean)
+    return f, clean
+
+
 library = load("library.json", {})  # file name without extension -> {key, camelot, bpm, genre, album, year, cover, added}
 lib_lock, pending = threading.Lock(), set()
 
@@ -364,6 +460,8 @@ def analyzer():
         result, f = {}, None
         try:  # background worker: one bad file must not stop the rest
             f = song_file(name, path)
+            if job:
+                f, name = tidy(job, name, f)
             if job and settings["format"] == "aiff" and f.suffix == ".wav":
                 f = to_aiff(f)
             r = subprocess.run([str(VENV_PY), "-I", str(ANALYZER), str(f)], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
@@ -376,12 +474,17 @@ def analyzer():
                 write_tags(f, result)
             except Exception:
                 pass
+            match = job["info"].get(name, {}).get("match") if job else None
             with lib_lock:
-                library[f.stem] = {**result, "added": library.get(f.stem, {}).get("added") or f.stat().st_mtime}
+                old = library.get(f.stem, {})
+                library[f.stem] = {**result, "added": old.get("added") or f.stat().st_mtime,
+                                   **({"match": match} if match is not None else {"match": old["match"]} if "match" in old else {}),
+                                   **({"kbps": job["kbps"]} if job and job.get("kbps") else {})}
                 save("library.json", library)
             pending.discard(f.stem)
         if job:
             set_info(job, name, state="done", **result)
+            persist()
 
 
 def library_list():
@@ -397,8 +500,29 @@ def library_list():
             analysis.put((None, f.stem, str(f)))
         artist, title = (f.stem.split(" - ", 1) if " - " in f.stem else ("", f.stem))
         out.append({**(i or {}), "name": f.stem, "file": f.name, "artist": artist, "title": title, "ext": f.suffix[1:].upper(),
-                    "size": st.st_size, "added": (i or {}).get("added") or st.st_mtime, "state": "done" if i else "analyzing"})
+                    "size": st.st_size, "added": (i or {}).get("added") or st.st_mtime, "state": "done" if i else "analyzing",
+                    "messy": clean_name(f.stem) != f.stem})
+    counts = {}
+    for s in out:
+        counts[song_key(s["name"])] = counts.get(song_key(s["name"]), 0) + 1
+    for s in out:
+        s["dup"] = counts[song_key(s["name"])] > 1
     return out
+
+
+def tidy_library():
+    """Clean every messy file name in the folder (never overwrites; duplicates are only flagged)."""
+    n = 0
+    for s in library_list():
+        new = OUT / (clean_name(s["name"]) + Path(s["file"]).suffix)
+        if s["messy"] and not new.exists():
+            (OUT / s["file"]).rename(new)
+            with lib_lock:
+                if s["name"] in library:
+                    library[new.stem] = library.pop(s["name"])
+            n += 1
+    save("library.json", library)
+    return n
 
 
 def execute(job, cmd):
@@ -448,36 +572,145 @@ def remove_partials(job):
 
 def run(job):
     job["before"] = set(os.listdir(OUT))
-    code = execute(job, job["cmd"])
+    code = execute(job, job["pre"]) if job.get("pre") else 0  # e.g. installing the stem-separation library first
+    if code == 0 and not job.get("cancelled"):
+        code = execute(job, job["cmd"])
     retry = job.get("retry")  # a prepared second try (recognized songs), else the per-link fallback
-    if not job.get("cancelled") and not job["saved"] and (retry or can_fallback(job["url"], job["log"])):
+    if not job.get("cancelled") and not job["saved"] and not job.get("stems") and (retry or can_fallback(job["url"], job["log"])):
         job["log"] = ("Trying YouTube Music…" if retry else
                       f"{'Spotify' if 'spotify' in job['url'] else 'SoundCloud'} won't give this song. Getting it from YouTube Music…")
+        job["fallback"] = True
         cmd = retry or fallback(job["url"])
         code = execute(job, cmd) if cmd else 1
         if not cmd:
             job["log"] = "Couldn't find this song on YouTube Music either."
     if job.get("cancelled"):
         job["status"] = "cancelled"
-        return remove_partials(job)
+        remove_partials(job)
+        return persist()
     job["status"] = "done" if code == 0 or job["saved"] else "failed"
+    name = job.get("playlist") or (job["url"] if job.get("chart") and job["total"] > 1 else None)
+    if name and job["songs"]:  # remembered for the Rekordbox / Serato / M3U export
+        playlists[name] = list(dict.fromkeys(playlists.get(name, []) + job["songs"]))
+        save("playlists.json", playlists)
+        threading.Thread(target=export_all, daemon=True).start()
+    persist()
     if WINDOW:  # the browser page shows its own notifications
         notify("Download finished" if job["status"] == "done" else "Download failed",
-               f"{job['saved']} song{'s' if job['saved'] != 1 else ''} saved" if job["status"] == "done" else job["url"])
-    if settings["open_when_done"] and job["saved"]:
+               ("Stems ready" if job.get("stems") else f"{job['saved']} song{'s' if job['saved'] != 1 else ''} saved")
+               if job["status"] == "done" else job["url"])
+    if settings["open_when_done"] and (job["saved"] or job.get("stems")):
         reveal()
 
 
+MAX_PARALLEL = 2  # downloads at once; the rest wait their turn (a 100-song chart is one download)
+
+
 def start(url, cmd, **extra):
-    """Create a download job and run it in the background."""
-    job = {"id": next(ids), "url": url, "cmd": cmd, "status": "running", "saved": 0, "songs": [], "total": 0,
-           "pct": 0, "info": {}, "log": "Starting…", **extra}
+    """Add a download to the queue."""
+    job = {"id": next(ids), "url": url, "cmd": cmd, "status": "queued", "saved": 0, "songs": [], "total": 0,
+           "pct": 0, "info": {}, "log": "Waiting for other downloads to finish…", **extra}
     if not cmd:
         job.update(status="failed", log="That's not a link I can download.")
-    else:
-        threading.Thread(target=run, args=(job,), daemon=True).start()
     jobs.append(job)
+    persist()
     return job
+
+
+def dispatcher():
+    while True:
+        running = sum(j["status"] == "running" for j in jobs)
+        for job in list(jobs):
+            if running >= MAX_PARALLEL:
+                break
+            if job["status"] == "queued":
+                job.update(status="running", log="Starting…")
+                running += 1
+                threading.Thread(target=run, args=(job,), daemon=True).start()
+        time.sleep(0.4)
+
+
+def persist():
+    """Save the last 40 downloads, so the list and any unfinished downloads survive a quit or crash."""
+    for _ in range(3):
+        try:  # other threads update jobs while we copy them: just try again
+            snap = [{k: v for k, v in j.items() if k not in ("proc", "before", "isrc_urls", "scores", "matches")} for j in jobs[-40:]]
+            return save("queue.json", snap)
+        except (RuntimeError, TypeError):
+            time.sleep(0.05)
+
+
+def restore():
+    """Bring back the saved downloads; unfinished ones start again (finished songs are skipped by the tools)."""
+    global ids
+    saved = load("queue.json", [])
+    for job in saved:
+        if job["status"] in ("running", "queued"):
+            job.update(status="queued", saved=0, songs=[], info={}, pct=0, log="Resuming after restart…")
+    jobs.extend(saved)
+    ids = itertools.count(max((j["id"] for j in saved), default=0) + 1)
+
+
+# ---- playlists for DJ software: Rekordbox XML, Serato crates, M3U8, all in <folder>/Playlists
+playlists = load("playlists.json", {})  # name -> song names
+
+
+def export_all():
+    """Write every remembered playlist (plus a full-library one) for Rekordbox, Serato and other players."""
+    out_dir = OUT / "Playlists"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    songs = [f for f in sorted(OUT.iterdir()) if f.suffix.lower() in AUDIO and f.is_file()]
+    lists = {"MUSICXX · All songs": songs}
+    for name, names in playlists.items():
+        lists[name] = [f for f in (song_file(n) for n in names) if f]
+    safe = lambda n: re.sub(r'[\\/:*?"<>|%]', "-", n).strip() or "Playlist"
+    for name, files in lists.items():  # M3U8: Rekordbox "Import playlist", VLC, Apple Music, Traktor
+        (out_dir / f"{safe(name)}.m3u8").write_text("#EXTM3U\n" + "".join(f"{f}\n" for f in files), encoding="utf-8")
+    # Rekordbox: Preferences > Advanced > rekordbox xml > choose this file; the playlists appear under "rekordbox xml"
+    tid = {f: i for i, f in enumerate(songs, 1)}
+    def track(f, i):
+        info, (artist, _, title) = library.get(f.stem, {}), f.stem.partition(" - ") if " - " in f.stem else ("", "", f.stem)
+        loc = "file://localhost" + quote(f.as_posix() if f.as_posix().startswith("/") else "/" + f.as_posix(), safe="/:")
+        attrs = {"TrackID": i, "Name": title, "Artist": artist, "Album": info.get("album", ""), "Genre": info.get("genre", ""),
+                 "Kind": f.suffix[1:].upper() + " File", "Size": f.stat().st_size, "AverageBpm": f"{info.get('bpm', 0):.2f}",
+                 "Tonality": short_key(info.get("key", "")), "Year": info.get("year", ""), "Location": loc}
+        return "<TRACK " + " ".join(f"{k}={quoteattr(str(v))}" for k, v in attrs.items()) + "/>"
+    xml = ['<?xml version="1.0" encoding="UTF-8"?>', '<DJ_PLAYLISTS Version="1.0.0">', '<PRODUCT Name="MUSICXX" Version="1" Company="MUSICXX"/>',
+           f'<COLLECTION Entries="{len(songs)}">', *(track(f, i) for f, i in tid.items()), "</COLLECTION>",
+           f'<PLAYLISTS><NODE Type="0" Name="ROOT" Count="1"><NODE Type="0" Name="MUSICXX" Count="{len(lists)}">']
+    for name, files in lists.items():
+        keys = [tid[f] for f in files if f in tid]
+        xml.append(f'<NODE Name={quoteattr(name)} Type="1" KeyType="0" Entries="{len(keys)}">' + "".join(f'<TRACK Key="{k}"/>' for k in keys) + "</NODE>")
+    xml.append("</NODE></NODE></PLAYLISTS></DJ_PLAYLISTS>")
+    (out_dir / "MUSICXX for Rekordbox.xml").write_text("\n".join(xml), encoding="utf-8")
+    # Serato: a crate per playlist, under a "MUSICXX" parent crate (only if Serato is installed)
+    serato = Path.home() / "Music" / "_Serato_"
+    if serato.is_dir():
+        (serato / "Subcrates").mkdir(exist_ok=True)
+        rec = lambda tag, data: tag.encode() + len(data).to_bytes(4, "big") + data
+        u16 = lambda t: t.encode("utf-16-be")
+        for name, files in lists.items():
+            body = rec("vrsn", u16("1.0/Serato ScratchLive Crate"))
+            for f in files:  # Serato stores paths relative to the drive, without the leading slash or drive letter
+                body += rec("otrk", rec("ptrk", u16(f.as_posix().split(":", 1)[-1].lstrip("/"))))
+            (serato / "Subcrates" / f"MUSICXX%%{safe(name)}.crate").write_bytes(body)
+    return {"folder": str(out_dir), "playlists": len(lists), "serato": serato.is_dir()}
+
+
+def stems(name):
+    """Split a song into vocals / drums / bass / other with Demucs, into <folder>/Stems/htdemucs/<song>/."""
+    n = Path(name)  # the page sends the file name; song_file wants it without the extension
+    f = song_file(n.stem if n.suffix.lower() in AUDIO else n.name)
+    if not f:
+        return None
+    pre = None
+    if not importlib.util.find_spec("demucs"):
+        if not OWN_PYTHON:
+            return None
+        # torch/torchaudio < 2.9: newer torchaudio can't save audio without an extra library
+        pre = [sys.executable, "-m", "pip", "install", "demucs", "torch<2.9", "torchaudio<2.9", "soundfile"]
+    return start(f"Stems · {f.stem}", [sys.executable, "-m", "demucs", "-n", "htdemucs", "-o", str(OUT / "Stems"),
+                                       "--filename", "{track}/{stem}.{ext}", str(f)], stems=f.stem, pre=pre)
 
 
 def notify(title, text):
@@ -499,11 +732,11 @@ SYNC_EVERY = 3 * 3600
 
 
 def sync_now(entry):
-    if any(j["url"] == entry["url"] and j["status"] == "running" for j in jobs):
+    if any(j["url"] == entry["url"] and j["status"] in ("running", "queued") for j in jobs):
         return
     url = entry["url"]  # archives remember what was fetched, so each sync only downloads new songs
     cmd = (spotdl(url, archive=DATA / "spotdl-archive.txt") if "spotify.com/" in url else
-           ytdlp(url, "%(uploader)s - %(title)s", "--download-archive", str(DATA / "ytdlp-archive.txt")))
+           ytdlp(url, YT_NAME, "--download-archive", str(DATA / "ytdlp-archive.txt")))
     start(url, cmd, sync=True)
     entry["last"] = time.time()
     save("sync.json", syncs)
@@ -569,15 +802,15 @@ def clipboard_watcher():
 def update_tools():
     """Once a day, upgrade yt-dlp and spotdl: the sites change often and old versions stop working.
     Only in the installer's venv."""
-    if sys.prefix == sys.base_prefix:
+    if not OWN_PYTHON:
         return
     stamp = DATA / "tools-updated"
     if stamp.exists() and time.time() - stamp.stat().st_mtime < 86400:
         return
     # shortcut: a download started during the ~30 s upgrade could hit a half-installed tool; fine for a daily job
-    while any(j["status"] == "running" for j in jobs):
+    while any(j["status"] in ("running", "queued") for j in jobs):
         time.sleep(30)
-    r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "yt-dlp[default]", "spotdl", "deno"], capture_output=True)
+    r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", *PIP_USER, "yt-dlp[default]", "spotdl", "deno"], capture_output=True)
     if r.returncode == 0:
         DATA.mkdir(parents=True, exist_ok=True)
         stamp.touch()
@@ -648,6 +881,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send(json.dumps({"text": read_clipboard().strip()}))
         elif self.path == "/library":
             self.send(json.dumps(library_list()))
+        elif self.path == "/phone":
+            self.send(json.dumps(phone_info()))
         elif self.path == "/settings":
             self.send(json.dumps({**settings, "syncs": syncs, "window": bool(WINDOW)}))
         elif self.path.startswith("/file?"):
@@ -695,13 +930,31 @@ class Handler(BaseHTTPRequestHandler):
             reveal(song)
             return self.send("{}")
         job = next((j for j in jobs if j["id"] == body.get("id")), None)
+        if self.path == "/cancel" and job and job["status"] == "queued":
+            job.update(status="cancelled", cancelled=True)
+            persist()
+            return self.send("{}")
         if self.path == "/cancel" and job and job["status"] == "running":
             job["cancelled"] = True
             kill(job.get("proc"))
             return self.send("{}")
+        if self.path == "/stems":
+            job = stems(str(body.get("name", "")))
+            return self.send(json.dumps({"job": job["id"]} if job else {"error": "unavailable"}), code=200 if job else 400)
+        if self.path == "/export":
+            return self.send(json.dumps(export_all()))
+        if self.path == "/save-set":  # a set built in the Library's mixing helper
+            names = [Path(str(n)).name for n in body.get("songs", []) if isinstance(n, str)][:200]
+            if not names:
+                return self.send('{"error":"empty"}', code=400)
+            playlists[f"MUSICXX Set {time.strftime('%Y-%m-%d %H.%M')}"] = names
+            save("playlists.json", playlists)
+            return self.send(json.dumps(export_all()))
+        if self.path == "/tidy":
+            return self.send(json.dumps({"renamed": tidy_library()}))
         if self.path == "/retry" and job and job["status"] in ("failed", "cancelled"):
             new = start(job["url"], command(job["url"]) or job["cmd"],
-                        **{k: job[k] for k in ("chart", "shazam", "cover", "retry", "total", "sync") if k in job})
+                        **{k: job[k] for k in ("chart", "shazam", "cover", "retry", "total", "sync", "stems", "pre") if k in job})
             return self.send(json.dumps([new["id"]]))
         if self.path == "/settings":
             return self.send(json.dumps(update_settings(body)))
@@ -759,6 +1012,9 @@ def update_settings(body):
     for k in ("open_when_done", "clipboard"):
         if isinstance(body.get(k), bool):
             settings[k] = body[k]
+    if isinstance(body.get("phone"), bool):
+        settings["phone"] = body["phone"]
+        phone(body["phone"])
     folder = body.get("folder")
     if isinstance(folder, str) and folder.strip():
         f = Path(folder.strip()).expanduser()
@@ -791,6 +1047,111 @@ def choose_folder():
         return ""
 
 
+# ---- phone: a small page on the local network to send links from a phone. Off until turned on in Settings;
+# every request must carry the secret token from the QR code, and it can only add downloads and list them.
+PHONE_PORT = 8766
+phone_server = None
+
+
+def lan_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))  # UDP "connect" sends nothing; it just picks the Wi-Fi address
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def phone_url():
+    return f"http://{lan_ip()}:{PHONE_PORT}/m/{settings['phone_token']}"
+
+
+def phone(on):
+    global phone_server
+    if on and not phone_server:
+        settings.setdefault("phone_token", secrets.token_urlsafe(16))
+        save("settings.json", settings)
+        try:
+            phone_server = ThreadingHTTPServer(("0.0.0.0", PHONE_PORT), PhoneHandler)
+        except OSError:
+            return
+        threading.Thread(target=phone_server.serve_forever, daemon=True).start()
+    elif not on and phone_server:
+        phone_server.shutdown()
+        phone_server.server_close()
+        phone_server = None
+
+
+def phone_info():
+    if not phone_server:
+        return {"on": False}
+    url, svg = phone_url(), ""
+    if ensure("segno"):
+        import segno
+        svg = segno.make(url, error="m").svg_inline(scale=5, dark="#000", light="#fff", border=2)
+    return {"on": True, "url": url, "svg": svg}
+
+
+class PhoneHandler(BaseHTTPRequestHandler):
+    send = Handler.send
+
+    def log_message(self, *a):
+        pass
+
+    def route(self):
+        """The part of the path after /m/<token>/, or None if the token is wrong."""
+        parts = self.path.split("?")[0].split("/")
+        ok = len(parts) >= 3 and parts[1] == "m" and hmac.compare_digest(parts[2], settings.get("phone_token", " "))
+        return "/".join(parts[3:]) if ok else None
+
+    def do_GET(self):
+        r = self.route()
+        if r == "":
+            self.send(PHONE_PAGE, "text/html; charset=utf-8")
+        elif r == "jobs":
+            self.send(json.dumps([{"url": j["url"], "status": j["status"], "saved": j["saved"], "songs": j["songs"][-3:]}
+                                  for j in jobs[-8:]][::-1]))
+        elif r == "logo.png" and LOGO.is_file():
+            self.send(LOGO.read_bytes(), "image/png")
+        else:
+            self.send("{}", code=404)
+
+    def do_POST(self):
+        size = int(self.headers.get("Content-Length") or 0)
+        if self.route() != "send" or self.headers.get("Content-Type") != "application/json" or size > 20_000:
+            return self.send("{}", code=404)
+        try:
+            urls = str(json.loads(self.rfile.read(size)).get("text", "")).split()[:20]
+        except (ValueError, AttributeError):
+            return self.send("{}", code=400)
+        self.send(json.dumps([start(u, command(u))["id"] for u in urls if u.startswith(("http://", "https://"))]))
+
+
+PHONE_PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MUSICXX</title><style>
+:root{color-scheme:dark}body{margin:0;font:16px/1.4 -apple-system,system-ui,sans-serif;background:#1e2124;color:#f5f5f7;padding:24px 16px}
+.top{display:flex;align-items:center;gap:10px;margin-bottom:18px}.top img{width:32px}h1{font-size:20px;margin:0}
+textarea{width:100%;box-sizing:border-box;min-height:90px;font:inherit;color:inherit;background:#272a2e;border:1px solid #3b3f45;border-radius:10px;padding:12px}
+button{width:100%;margin-top:10px;padding:14px;font:inherit;font-weight:600;border:0;border-radius:10px;background:#e0362c;color:#fff}
+p{color:#98989d;font-size:14px}ul{list-style:none;padding:0}li{padding:10px 0;border-top:1px solid #3b3f45;font-size:14px}li small{display:block;color:#98989d}
+</style></head><body><div class="top"><img src="logo.png" alt=""><h1>Send to MUSICXX</h1></div>
+<p>Paste a Spotify, YouTube or SoundCloud link. It downloads on your computer.</p>
+<textarea id="t" placeholder="Paste a link…"></textarea><button id="go">Download on my computer</button><p id="msg"></p><ul id="list"></ul>
+<script>
+const $=id=>document.getElementById(id),esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+$('go').onclick=async()=>{const text=$('t').value.trim();if(!text)return;
+  try{const r=await fetch('send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
+    $('msg').textContent=r.ok?'Sent! Downloading on your computer.':'Couldn\'t send that.';if(r.ok)$('t').value=''}catch(e){$('msg').textContent='Can\'t reach your computer. Is MUSICXX open, on the same Wi-Fi?'}
+  load()};
+const word={queued:'Waiting',running:'Downloading…',done:'Done',failed:'Failed',cancelled:'Cancelled'};
+async function load(){try{const j=await (await fetch('jobs')).json();
+  $('list').innerHTML=j.map(x=>`<li>${esc(x.songs[x.songs.length-1]||x.url)}<small>${word[x.status]||x.status}${x.saved?' · '+x.saved+' saved':''}</small></li>`).join('')}catch(e){}}
+load();setInterval(load,3000);
+</script></body></html>"""
+
+
 WINDOW = None  # the native app window, when pywebview is available
 
 
@@ -816,7 +1177,7 @@ def watch_busy():
     """Dock badge with the number of running downloads (Mac), and ask before closing the window mid-download."""
     shown = None
     while True:
-        n = sum(j["status"] == "running" for j in jobs)
+        n = sum(j["status"] in ("running", "queued") for j in jobs)
         if n != shown:
             shown = n
             if WINDOW:
@@ -857,7 +1218,7 @@ PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport
 :root{--bg:#1e2124;--bg2:#33373c;--panel:#272a2e;--hover:#31353a;--line:#3b3f45;--text:#f5f5f7;--muted:#98989d;
 --red:#e0362c;--red2:#e0362c;--ok:#30d158;--bad:#ff453a;--sp:#1db954;--yt:#ff3b30;--sc:#ff7700;--shadow:0 4px 16px rgba(0,0,0,.35)}
 :root{color-scheme:dark;--metal:linear-gradient(180deg,#3a3e44,#2a2d32)}
-*{box-sizing:border-box}html,body{height:100%}
+*{box-sizing:border-box}html,body{height:100%}[hidden]{display:none!important}
 body{margin:0;color:var(--text);background:repeating-linear-gradient(90deg,rgba(255,255,255,.015) 0 1px,transparent 1px 3px),linear-gradient(160deg,#2c3035 0%,#1a1c1f 50%,#26292e 100%) fixed;font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;display:flex;flex-direction:column}
 button{font:inherit;border:0;cursor:pointer;color:inherit;background:none}
 button:focus-visible,textarea:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--red);outline-offset:2px}
@@ -1036,6 +1397,14 @@ background:repeating-linear-gradient(-45deg,rgba(255,255,255,.035) 0 10px,transp
 .set .chk{display:flex;gap:10px;align-items:center;margin:4px 0}.set .chk input{width:16px;height:16px;accent-color:var(--red)}
 .syncs{list-style:none;margin:8px 0 0;padding:0}.syncs li{display:flex;gap:8px;align-items:center;padding:6px 0;border-top:1px solid var(--line);font-size:13px}
 .syncs li span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.syncs li small{color:var(--muted)}
+.tag.ok{background:color-mix(in srgb,var(--ok) 22%,transparent);color:var(--ok)}.tag.warn{background:color-mix(in srgb,#ff9f0a 22%,transparent);color:#ff9f0a}
+.ltab tr.anchor td{background:color-mix(in srgb,var(--red) 18%,transparent)}.ltab tr.mix td:first-child{box-shadow:inset 3px 0 var(--ok)}.ltab tr.dim{opacity:.35}
+.ltab tbody tr{cursor:default}.lbar .pill{white-space:nowrap}
+#mixbar{display:none;align-items:center;gap:8px;flex-wrap:wrap;margin:-4px 0 12px;padding:10px 12px;border-radius:10px;background:var(--panel);border:1px solid var(--line);font-size:13px}#mixbar.show{display:flex}
+#mixbar b{font-weight:600}#mixbar .sp{flex:1}
+#setlist{display:none;margin:0 0 14px;padding:12px 14px;border-radius:10px;background:var(--panel);border:1px solid var(--line)}#setlist.show{display:block}
+#setlist ol{margin:8px 0;padding-left:22px;font-size:13px;columns:2;column-gap:28px}#setlist li{margin:2px 0}#setlist li small{color:var(--muted)}
+.qr{display:flex;gap:14px;align-items:center;margin-top:10px}.qr svg{width:150px;height:150px;border-radius:6px;flex:none}.qr code{font-size:11.5px;word-break:break-all;color:var(--muted)}
 /* copied-link banner */
 #clip{position:fixed;top:62px;right:16px;z-index:12;display:none;align-items:center;gap:10px;max-width:min(520px,92vw);padding:10px 10px 10px 14px;border-radius:10px;background:var(--panel);border:1px solid var(--line);box-shadow:0 10px 30px rgba(0,0,0,.4);animation:fade .2s}
 #clip.show{display:flex}#clip .u{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:12.5px}#clip b{white-space:nowrap}
@@ -1057,7 +1426,9 @@ nav button{padding:5px 9px}.grid{grid-template-columns:repeat(2,1fr);gap:10px}#p
 <div class="chead"><h2><span id="cname">Loading…</span><small>Trending on Shazam · updated weekly</small></h2><button class="big" id="all"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12M6 11l6 6 6-6M5 20h14"/></svg>Download all</button></div>
 <ul class="tracks" id="tracks"></ul></div></section>
 <section id="library"><div class="wrap wide">
-<div class="lbar"><form class="sbox" onsubmit="return false"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="lq" type="search" placeholder="Search your songs by title, artist, genre or key…" aria-label="Search library" autocomplete="off"></form><small id="lcount"></small></div>
+<div class="lbar"><form class="sbox" onsubmit="return false"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="lq" type="search" placeholder="Search your songs by title, artist, genre or key…" aria-label="Search library" autocomplete="off"></form><small id="lcount"></small><button class="pill" id="ldup" hidden></button><button class="pill" id="ltidy" hidden title="Remove doubled artist names and tags like (Official Video) from file names">Tidy names</button><button class="pill" id="lexport" title="Write playlists for Rekordbox, Serato and other DJ apps">Export to DJ apps</button></div>
+<div id="mixbar"><span>Mixes with <b id="mixname"></b>: <span id="mixinfo"></span></span><span class="sp"></span><label class="chk" style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="mixonly">Only matches</label><button class="pill" id="mixset">Suggest a set</button><button class="ico" id="mixx" title="Clear"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>
+<div id="setlist"><b>Suggested set</b> <small class="mut">each song mixes into the next (compatible key, BPM within 6%)</small><ol id="setol"></ol><button class="pill" id="setsave">Save as playlist for DJ apps</button></div>
 <table class="ltab"><thead><tr><th data-s="title">Title</th><th data-s="camelot">Key</th><th data-s="bpm">BPM</th><th data-s="genre">Genre</th><th data-s="ext">Format</th><th data-s="added" class="on">Added</th><th></th></tr></thead><tbody id="lrows"></tbody></table>
 <div class="empty" id="lempty" hidden>No songs yet. Everything you download shows up here.</div></div></section>
 <section id="explore"><div class="wrap">
@@ -1077,6 +1448,7 @@ nav button{padding:5px 9px}.grid{grid-template-columns:repeat(2,1fr);gap:10px}#p
 <div class="set"><label class="t" for="sformat">File format</label><div class="line"><select id="sformat"><option value="wav">WAV · lossless</option><option value="aiff">AIFF · lossless, best for DJ software</option><option value="flac">FLAC · lossless, smaller files</option><option value="mp3">MP3 · 320 kbps, smallest</option></select></div>
 <p>All formats get the artist, title, cover, key and BPM written inside the file. AIFF and FLAC show them in every DJ app; WAV tags are read by Serato and Rekordbox but not by Apple Music.</p></div>
 <div class="set"><label class="chk"><input type="checkbox" id="sopen">Open the folder when a download finishes</label><label class="chk"><input type="checkbox" id="sclip">Offer to download links I copy</label></div>
+<div class="set"><label class="chk"><input type="checkbox" id="sphone">Send songs from my phone</label><p>Shows a QR code: scan it with your phone (on the same Wi-Fi) to get a page where you paste links that download here. Only someone with the code can use it.</p><div id="sqr"></div></div>
 <div class="set"><label class="t">Synced playlists</label><p>New songs added to these playlists download automatically every 3 hours while MUSICXX is open. Turn it on with <b>Keep synced</b> on a downloaded playlist.</p><ul class="syncs" id="ssyncs"></ul></div></div></div>
 <div id="ticker" aria-hidden="true"><div class="tk"></div></div>
 <div id="rec" role="dialog" aria-modal="true" aria-labelledby="rech"><div class="box"><div class="orb"><i></i><i></i><i></i><img src="/logo.png" alt=""></div>
@@ -1101,24 +1473,27 @@ const small=u=>u?u.replace('600x600bb','100x100bb'):'';
 const X='<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>';
 function card(j){
   const n=j.saved,k=kind(j.url);let head,bar='',meta='';
-  if(j.status=='running'){
-    head=`<span class="spin"></span>Downloading…<button class="ico x" data-cancel="${j.id}" title="Cancel">${X}</button>`;
+  if(j.status=='queued')head=`<span class="cancelled">Waiting in line…</span><button class="ico x" data-cancel="${j.id}" title="Remove from the queue">${X}</button>`,meta=esc(j.log||'');
+  else if(j.status=='running'){
+    head=`<span class="spin"></span>${j.stems?'Separating stems…':'Downloading…'}<button class="ico x" data-cancel="${j.id}" title="Cancel">${X}</button>`;
     const p=j.total?Math.min(100,n/j.total*100):j.pct;
     bar=`<div class="bar ${p?'':'indef'}"><i style="width:${p}%"></i></div>`;
     meta=(j.total?`${n} / ${j.total} songs`:j.pct?`${j.pct.toFixed(0)}%`:'')+(j.log?' · '+esc(j.log):'');
-  }else if(j.status=='done')head=`<span class="done"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg>${plural(n)} saved to ${esc(where())}</span>`;
+  }else if(j.status=='done'&&j.stems)head=`<span class="done">${OK}Stems ready: vocals, drums, bass, other</span>`,meta=`In ${esc(where())}/Stems/htdemucs/${esc(j.stems)}`;
+  else if(j.status=='done')head=`<span class="done"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg>${plural(n)} saved to ${esc(where())}</span>`;
   else if(j.status=='cancelled')head=`<span class="cancelled">Cancelled${n?' ('+plural(n)+' saved)':''}</span>`;
   else{head=`<span class="failed">✕ Couldn't download${n?' everything ('+plural(n)+' saved)':''}</span>`;meta=esc(j.log)}
   const all=open.has(j.id),list=all?j.songs:j.songs.slice(-5);
   const cover=j.cover||Object.values(j.info||{}).map(i=>i.cover).find(Boolean);
-  const src=`<div class="src">${cover?`<img class="cv" src="${esc(small(cover))}" alt="">`:''}${j.shazam?'<span class="chip shz"><i></i>Identified by Shazam</span>':j.chart?'<span class="chip ch">Chart</span>':chip(k)}${j.sync?'<span class="chip syn"><i></i>Synced playlist</span>':''}</div>`;
+  const src=`<div class="src">${cover?`<img class="cv" src="${esc(small(cover))}" alt="">`:''}${j.stems?'<span class="chip">Stems</span>':j.shazam?'<span class="chip shz"><i></i>Identified by Shazam</span>':j.chart?'<span class="chip ch">Chart</span>':chip(k)}${j.sync?'<span class="chip syn"><i></i>Synced playlist</span>':''}</div>`;
   const songs=list.length?`<ul class="songs">${list.map(s=>`<li><button data-song="${esc(s)}">${j.info&&j.info[s]&&j.info[s].cover?`<img src="${esc(small(j.info[s].cover))}" alt="">`:'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>'}<span>${esc(s)}</span><em>Show file</em></button>${tags(j.info&&j.info[s])}</li>`).join('')}</ul>`+
     (j.songs.length>5?`<button class="more" data-more="${j.id}">${all?'Show less':'Show all '+j.songs.length}</button>`:''):'';
   const pl=k&&/Playlist|Album/.test(k[2])&&!j.chart,on=cfg.syncs.some(e=>e.url==j.url);
   const sync=pl&&j.status!='running'?`<button class="pill${on?' on':''}" data-sync="${esc(j.url)}" title="Download new songs from this playlist automatically">${on?'✓ Synced':'Keep synced'}</button>`:'';
   const retry=/failed|cancelled/.test(j.status)?`<div class="actions"><button class="pill" data-retry="${j.id}">Retry</button>${sync}</div>`:'';
   const acts=retry||(j.status=='done'?`<div class="actions">${sync}<button class="pill" data-folder><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>Open folder</button></div>`:'');
-  return `${src}<div class="status">${head}</div>${bar}${meta?`<div class="meta">${meta}</div>`:''}${songs}${acts}`;
+  const q=j.kbps&&j.status!='running'?`<div class="meta" title="A WAV, AIFF or FLAC can't sound better than the source it was made from">Source quality: about ${j.kbps} kbps</div>`:'';
+  return `${src}<div class="status">${head}</div>${bar}${meta?`<div class="meta">${meta}</div>`:''}${q}${songs}${acts}`;
 }
 function tags(i){  // key / BPM / genre for one song
   if(!i)return'';
@@ -1127,7 +1502,14 @@ function tags(i){  // key / BPM / genre for one song
   if(i.camelot)t.push(`<b class="tag cam" style="--h:${(parseInt(i.camelot)-1)*30}" title="Camelot key">${esc(i.camelot)}</b>`,`<b class="tag" title="Key">${esc(i.key)}</b>`);
   if(i.bpm)t.push(`<b class="tag" title="Tempo (estimate)">${i.bpm} BPM</b>`);
   if(i.genre)t.push(`<b class="tag gen" title="Genre">${esc(i.genre)}</b>`);
+  const m=matchTag(i.match);if(m)t.push(m);
+  if(i.duplicate)t.push('<b class="tag warn" title="This song was already in your folder, so the new copy was removed">Already in your library</b>');
   return`<div class="tags">${t.join('')||'<b class="tag">Couldn\'t analyze this one</b>'}</div>`}
+function matchTag(m){  // how sure we are this is the same recording as on Spotify
+  if(m=='exact')return'<b class="tag ok" title="Same recording code (ISRC) as the Spotify song">✓ Exact recording</b>';
+  if(m=='search')return'<b class="tag warn" title="Found by searching YouTube Music for the title: check it\'s the right version">⚠ Closest match</b>';
+  if(typeof m=='number')return m>=90?`<b class="tag ok" title="Title, artist and length match the Spotify song">✓ Match ${m}%</b>`:`<b class="tag warn" title="No exact version found: check it's the right one">⚠ Closest match ${m}%</b>`;
+  return''}
 function notify(j){if(!cfg.window&&document.hidden&&window.Notification&&Notification.permission=='granted')
   new Notification(j.status=='done'?'MUSICXX ✓ Download finished':'MUSICXX ✕ Download failed',{body:j.status=='done'?plural(j.saved)+' saved to '+where():short(j.url),icon:'/logo.png'})}
 function render(jobs){
@@ -1144,7 +1526,7 @@ function render(jobs){
     status[j.id]=j.status;
   }
   if(added)main.scrollTop=main.scrollHeight;
-  const busy=jobs.filter(j=>j.status=='running').length;
+  const busy=jobs.filter(j=>j.status=='running'||j.status=='queued').length;
   document.title=busy?`(${busy}) Downloading · MUSICXX`:'MUSICXX';
   $('busy').textContent=busy||'';
 }
@@ -1277,29 +1659,56 @@ async function poll(){try{render(await (await fetch('/jobs')).json());
 $('clipgo').onclick=()=>{send($('clip').dataset.url);$('clip').classList.remove('show');tab('');toast('Downloading the copied link')};
 $('clipx').onclick=()=>$('clip').classList.remove('show');
 // ---- Library: every song in the folder, with key / BPM / genre, searchable and sortable
-let lib=[],lsort='added',lasc=false,lplaying='';
+let lib=[],lsort='added',lasc=false,lplaying='',anchor=null,dupOnly=false;
+// Camelot neighbours: same key, one step around the wheel, or the relative major/minor
+const cam=c=>c?[parseInt(c),c.slice(-1)]:null;
+function keyOk(a,b){const x=cam(a),y=cam(b);if(!x||!y)return false;const d=Math.min((x[0]-y[0]+12)%12,(y[0]-x[0]+12)%12);
+  return x[1]==y[1]?d<=1:d==0}
+const bpmOk=(a,b)=>a&&b&&[1,2,.5].some(r=>Math.abs(b*r-a)/a<=.06);
+const mixes=(a,b)=>a!==b&&keyOk(a.camelot,b.camelot)&&bpmOk(a.bpm,b.bpm);
 async function loadLib(){try{lib=await (await fetch('/library')).json();renderLib()}catch(e){}}
 function renderLib(){
   const q=$('lq').value.trim().toLowerCase();
-  let rows=lib.filter(s=>!q||[s.title,s.artist,s.genre,s.key,s.camelot,s.album].join(' ').toLowerCase().includes(q));
+  const A=anchor&&lib.find(s=>s.file==anchor);if(anchor&&!A)anchor=null;
+  let rows=lib.filter(s=>(!q||[s.title,s.artist,s.genre,s.key,s.camelot,s.album].join(' ').toLowerCase().includes(q))&&(!dupOnly||s.dup)&&(!A||!$('mixonly').checked||s==A||mixes(A,s)));
+  const dups=lib.filter(s=>s.dup).length,messy=lib.filter(s=>s.messy).length;
+  $('ldup').hidden=!dups&&!dupOnly;$('ldup').textContent=dupOnly?'Show all songs':`${dups} possible duplicates`;$('ldup').classList.toggle('on',dupOnly);
+  $('ltidy').hidden=!messy;$('ltidy').textContent=`Tidy ${messy} file name${messy==1?'':'s'}`;
+  $('mixbar').classList.toggle('show',!!A);
+  if(A){$('mixname').textContent=A.title;$('mixinfo').textContent=`${A.camelot||'?'} · ${A.bpm||'?'} BPM · ${lib.filter(s=>mixes(A,s)).length} songs`}
   const v=s=>lsort=='camelot'?(s.camelot?parseInt(s.camelot)*2+(s.camelot.endsWith('B')?1:0):99):s[lsort]??'';
   rows.sort((a,b)=>{const x=v(a),y=v(b);const c=typeof x=='number'&&typeof y=='number'?x-y:String(x).localeCompare(String(y));return lasc?c:-c});
   document.querySelectorAll('.ltab th[data-s]').forEach(th=>{th.classList.toggle('on',th.dataset.s==lsort);th.classList.toggle('asc',lasc)});
   $('lcount').textContent=`${plural(rows.length)}${q?' found':''} · ${where()}`;
   $('lempty').hidden=!!lib.length;
-  $('lrows').innerHTML=rows.map(s=>`<tr class="${lplaying==s.file?'playing':''}"><td><div class="tt">${s.cover?`<img src="${esc(small(s.cover))}" alt="" loading="lazy">`:'<span class="ph0"></span>'}<div style="min-width:0"><b>${esc(s.title)}</b><span>${esc(s.artist)}</span></div></div></td>
+  $('lrows').innerHTML=rows.map(s=>`<tr data-row="${esc(s.file)}" class="${lplaying==s.file?'playing ':''}${A?(s==A?'anchor':mixes(A,s)?'mix':'dim'):''}" title="Click to see which songs mix with this one"><td><div class="tt">${s.cover?`<img src="${esc(small(s.cover))}" alt="" loading="lazy">`:'<span class="ph0"></span>'}<div style="min-width:0"><b>${esc(s.title)}</b><span>${esc(s.artist)}${s.dup?' · <span style="color:#ff9f0a">duplicate?</span>':''}</span></div></div></td>
   <td>${s.camelot?`<b class="tag cam" style="--h:${(parseInt(s.camelot)-1)*30}">${esc(s.camelot)}</b> <span class="mut">${esc(s.key)}</span>`:s.state=='analyzing'?'<span class="mut">Analyzing…</span>':''}</td>
-  <td class="num">${s.bpm||''}</td><td class="mut">${esc(s.genre||'')}</td><td class="mut">${esc(s.ext)}</td><td class="mut num">${new Date(s.added*1000).toLocaleDateString()}</td>
-  <td class="acts"><button class="ico" data-lplay="${esc(s.file)}" title="Play">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4l13 8-13 8z"/></svg>'}</button><button class="ico" data-lshow="${esc(s.name)}" title="Show in folder">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>'}</button></td></tr>`).join('')}
+  <td class="num" title="${s.lufs!=null?'Loudness '+s.lufs+' LUFS':''}">${s.bpm||''}</td><td class="mut">${esc(s.genre||'')}</td><td class="mut">${esc(s.ext)}</td><td class="mut num">${new Date(s.added*1000).toLocaleDateString()}</td>
+  <td class="acts"><button class="ico" data-lstems="${esc(s.file)}" title="Split into vocals, drums, bass and other">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h10M4 17h6"/></svg>'}</button><button class="ico" data-lplay="${esc(s.file)}" title="Play">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4l13 8-13 8z"/></svg>'}</button><button class="ico" data-lshow="${esc(s.name)}" title="Show in folder">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>'}</button></td></tr>`).join('')}
 $('lq').oninput=renderLib;
 document.querySelector('.ltab thead').onclick=e=>{const th=e.target.closest('th[data-s]');if(!th)return;
   if(lsort==th.dataset.s)lasc=!lasc;else{lsort=th.dataset.s;lasc=/title|genre|camelot|ext/.test(lsort)}renderLib()};
-$('lrows').onclick=e=>{const p=e.target.closest('[data-lplay]'),f=e.target.closest('[data-lshow]');
+$('lrows').onclick=e=>{const p=e.target.closest('[data-lplay]'),f=e.target.closest('[data-lshow]'),st=e.target.closest('[data-lstems]');
+  if(st){if(confirm('Split this song into vocals, drums, bass and other?\n\nTakes about a minute per song. The first time, MUSICXX also downloads the separation tool (about 1 GB).'))
+    post('/stems',{name:st.dataset.lstems}).then(r=>r.ok?(tab(''),toast('Separating stems…'),poll()):toast('Stem separation isn\'t available on this computer'));return}
+  if(!p&&!f){const r=e.target.closest('[data-row]');if(r){anchor=anchor==r.dataset.row?null:r.dataset.row;$('setlist').classList.remove('show');renderLib()}return}
   if(f)post('/open',{name:f.dataset.lshow});
   if(p){const s=lib.find(x=>x.file==p.dataset.lplay);if(!s)return;cur=null;lplaying=s.file;
     $('pt').textContent=s.title;$('pa').textContent=s.artist;$('pdl').hidden=$('popen').hidden=true;
     $('pframe').innerHTML=`<audio controls autoplay src="/file?name=${encodeURIComponent(s.file)}"></audio>`;$('player').classList.add('show');renderLib()}};
 setInterval(()=>{if(document.body.classList.contains('library'))loadLib()},4000);  // analysis progress
+$('mixx').onclick=()=>{anchor=null;$('setlist').classList.remove('show');renderLib()};$('mixonly').onchange=renderLib;
+$('ldup').onclick=()=>{dupOnly=!dupOnly;renderLib()};
+$('ltidy').onclick=async()=>{const r=await (await post('/tidy')).json();toast(`Renamed ${r.renamed} file${r.renamed==1?'':'s'}`);loadLib()};
+$('lexport').onclick=async()=>{const r=await (await post('/export')).json();
+  alert(`Saved ${r.playlists} playlists in:\n${r.folder}\n\nRekordbox: Preferences › Advanced › rekordbox xml › choose "MUSICXX for Rekordbox.xml". The playlists appear under "rekordbox xml" in the sidebar.\n${r.serato?'Serato: restart Serato and open the MUSICXX crates.':'Serato wasn\'t found on this computer; other apps can import the .m3u8 files.'}`)};
+let set=[];
+$('mixset').onclick=()=>{  // greedy: from the chosen song, always step to the closest-BPM song that mixes in
+  const A=lib.find(s=>s.file==anchor);if(!A)return;set=[A];
+  while(set.length<15){const last=set[set.length-1],next=lib.filter(s=>!set.includes(s)&&mixes(last,s)).sort((a,b)=>Math.abs(a.bpm-last.bpm)-Math.abs(b.bpm-last.bpm))[0];if(!next)break;set.push(next)}
+  $('setol').innerHTML=set.map(s=>`<li>${esc(s.title)} <small>${esc(s.camelot)} · ${s.bpm}</small></li>`).join('');
+  $('setlist').classList.add('show');$('setsave').hidden=set.length<2;if(set.length<2)$('setol').innerHTML='<li>No other song mixes with this one yet.</li>'};
+$('setsave').onclick=async()=>{const r=await post('/save-set',{songs:set.map(s=>s.name)});toast(r.ok?'Set saved: it\'s in the DJ-app playlists':'Couldn\'t save the set')};
 // ---- Settings
 function applyCfg(c){cfg=c;
   document.querySelectorAll('.where').forEach(e=>e.textContent=where());document.querySelectorAll('.fmt').forEach(e=>e.textContent='.'+cfg.format);
@@ -1309,7 +1718,7 @@ function applyCfg(c){cfg=c;
   for(const id in last)delete last[id];poll()}  // re-render cards (folder name, sync buttons)
 const saveCfg=async b=>applyCfg(await (await post('/settings',b)).json());
 fetch('/settings').then(r=>r.json()).then(applyCfg).catch(()=>{});
-$('gear').onclick=()=>{$('settings').classList.add('show');$('sfolder').focus()};
+$('gear').onclick=()=>{$('settings').classList.add('show');$('sfolder').focus();showPhone()};
 $('setx').onclick=()=>$('settings').classList.remove('show');
 $('settings').onclick=e=>{if(e.target.id=='settings')$('setx').click()};
 $('sfolder').onchange=()=>saveCfg({folder:$('sfolder').value});
@@ -1317,6 +1726,9 @@ $('schoose').onclick=async()=>{const r=await (await post('/choose-folder')).json
 $('sformat').onchange=()=>saveCfg({format:$('sformat').value});
 $('sopen').onchange=()=>saveCfg({open_when_done:$('sopen').checked});
 $('sclip').onchange=()=>saveCfg({clipboard:$('sclip').checked});
+async function showPhone(){const p=await (await fetch('/phone')).json();$('sphone').checked=p.on;
+  $('sqr').innerHTML=p.on?`<div class="qr">${p.svg||''}<div><b>Scan with your phone's camera</b><p>or open this address on your phone:</p><code>${esc(p.url)}</code></div></div>`:''}
+$('sphone').onchange=async()=>{await saveCfg({phone:$('sphone').checked});showPhone()};
 $('ssyncs').onclick=async e=>{const u=e.target.closest('[data-unsync]');
   if(u){await post('/sync',{url:u.dataset.unsync,on:false});saveCfg({})}
   if(e.target.id=='syncnow'){await post('/sync-now');$('setx').click();tab('');toast('Checking synced playlists for new songs…');poll()}};
@@ -1347,7 +1759,7 @@ chat.onclick=e=>{const b=e.target.closest('button');if(!b)return;
   else if(b.hasAttribute('data-charts'))tab('charts')};
 $('folder').onclick=()=>post('/open');
 $('quit').onclick=async()=>{
-  if(Object.values(status).includes('running')&&!confirm('Downloads are still running. Quit anyway?'))return;
+  if((Object.values(status).includes('running')||Object.values(status).includes('queued'))&&!confirm('Downloads are still running. Quit anyway? (They continue next time you open MUSICXX.)'))return;
   await post('/quit');document.body.innerHTML='<div style="margin:auto;text-align:center"><h2>MUSICXX stopped</h2><p style="color:var(--muted)">Open the app again to restart.</p></div>'};
 let depth=0;
 addEventListener('dragenter',e=>{e.preventDefault();depth++;document.body.classList.add('dragging')});
@@ -1386,7 +1798,7 @@ document.addEventListener('click',e=>{if(e.target.closest('[data-listen]'))liste
 $('recagain').onclick=listen;
 $('recx').onclick=()=>{recCancel=true;recStop();$('rec').className=''};
 addEventListener('keydown',e=>{if(e.key=='Escape'&&$('rec').classList.contains('show'))$('recx').click()});
-setInterval(poll,1000);poll();t.focus();if(location.hash=='#listen')listen();else if(location.hash=='#settings')$('gear').click();else if(location.hash=='#library')tab('library');else if(location.hash=='#charts')tab('charts');else if(location.hash.startsWith('#explore')){tab('explore');  // #explore/[platform/]QUERY searches right away
+setInterval(poll,1000);poll();t.focus();if(location.hash=='#listen')listen();else if(location.hash=='#settings')$('gear').click();else if(location.hash.startsWith('#mix/')){tab('library');loadLib().then(()=>{anchor=decodeURIComponent(location.hash.slice(5));renderLib();$('mixset').click()})}else if(location.hash=='#library')tab('library');else if(location.hash=='#charts')tab('charts');else if(location.hash.startsWith('#explore')){tab('explore');  // #explore/[platform/]QUERY searches right away
   let q=decodeURIComponent(location.hash.slice(9));const m=q.match(/^(spotify|youtube|soundcloud)\/(.*)$/);
   if(m){q=m[2];setPlat(m[1])}if(q){$('q').value=q;doSearch()}}
 </script></body></html>"""
@@ -1401,6 +1813,12 @@ def self_update():
     here = Path(__file__).resolve().parent
     if (here / ".git").exists() or os.environ.get("MUSICXX_UPDATED"):
         return False
+    if PIP_USER:  # packaged Mac app: its launcher runs ~/.musicxx/bundle-app/musicxx.py when that exists
+        target = DATA / "bundle-app"
+        target.mkdir(parents=True, exist_ok=True)
+        if not (target / "logo.png").exists() and LOGO.is_file():
+            (target / "logo.png").write_bytes(LOGO.read_bytes())
+        here = target
     # Fetch by commit id: raw.githubusercontent caches /main/ for 5 minutes and could hand back an older version
     sha = subprocess.run(["curl", "-sf", "--max-time", "10", "-H", "Accept: application/vnd.github.sha",
                           f"https://api.github.com/repos/{REPO}/commits/main"], capture_output=True, text=True).stdout.strip()
@@ -1423,9 +1841,9 @@ def self_update():
 def self_test():
     assert command("hello") is None
     sp = command("https://open.spotify.com/playlist/abc")
-    assert sp[0] == "spotdl" and sp[-1] == f"{OUT}/{{artists}} - {{title}}.{{output-ext}}"
+    assert "download" in sp and sp[-1] == f"{OUT}/{{artists}} - {{title}}.{{output-ext}}"
     yt = command("https://soundcloud.com/a/sets/b")
-    assert yt[0] == "yt-dlp" and yt[-1].endswith("/sets/b") and str(OUT) in yt
+    assert "-x" in yt and yt[-1].endswith("/sets/b") and str(OUT) in yt
     job = {"songs": [], "saved": 0, "total": 0, "pct": 0}
     for line in ["[download] Downloading item 2 of 12", "[download]  45.3% of 3.5MiB",
                  f"[ExtractAudio] Destination: {OUT}/A - B.wav", 'Downloaded "C - D": https://x',
@@ -1442,9 +1860,30 @@ def self_test():
     finally:
         settings["format"] = saved_format
     assert short_key("Ab minor") == "Abm" and short_key("C major") == "C"
+    assert clean_name("Luis Fonsi - Luis Fonsi - Despacito ft. Daddy Yankee") == "Luis Fonsi - Despacito ft. Daddy Yankee"
+    assert clean_name("Gradur - GRADUR - DÉCENNIE (VIZUALISER)") == "Gradur - DÉCENNIE"
+    assert clean_name("Tems - Free Mind (Official Video)") == "Tems - Free Mind" and clean_name("A - B (Remix)") == "A - B (Remix)"
+    assert song_key("Victony, BNXN - WHO THIS (feat. BNXN)") == song_key("Victony - Who This")
+    job = {"songs": [], "saved": 0, "total": 0, "pct": 0, "info": {}}
+    for line in ["INFO Found 12 songs in My Mix (Playlist)", "DEBUG [x] Best ISRC result is https://y/1 with score 99",
+                 "DEBUG Downloading A - B using https://y/1", "DEBUG [z] Returning best result https://y/2 with score 77",
+                 "DEBUG Downloading C - D using https://y/2", "[info] abc: Downloading 1 format(s): 251"]:
+        parse(job, line)
+    assert job["playlist"] == "My Mix" and job["matches"] == {"A - B": "exact", "C - D": 77} and job["kbps"] == 160, job
+    assert job["log"].startswith("[info]")  # debug lines never become the progress text
     assert LINK.match("https://open.spotify.com/track/1") and LINK.match("https://soundcloud.com/a/b") and not LINK.match("https://example.com/x")
     assert PLAYLIST.search("https://open.spotify.com/playlist/1") and PLAYLIST.search("https://soundcloud.com/a/sets/b")
     assert not PLAYLIST.search("https://open.spotify.com/track/1")
+    # smoke test: the real server answers every page the app loads
+    import urllib.request
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    page = urllib.request.urlopen(base + "/").read().decode()
+    assert "MUSICXX" in page and "<script>" in page
+    for path in ("/jobs", "/settings", "/library", "/clip", "/phone"):
+        json.loads(urllib.request.urlopen(base + path).read())
+    srv.shutdown()
     print("self-test ok")
 
 
@@ -1463,10 +1902,15 @@ if __name__ == "__main__":
     if self_update():  # restart on the new code
         server.server_close()
         launcher = Path(__file__).with_name("mac_launch.sh")  # keeps the "MUSICXX" Dock name on a Mac
-        subprocess.Popen(["/bin/sh", str(launcher)] if sys.platform == "darwin" and launcher.is_file() else
-                         [sys.executable, str(Path(__file__).resolve())], env={**os.environ, "MUSICXX_UPDATED": "1"})
+        cmd = ([sys.executable] if PIP_USER else  # the packaged app's launcher picks the updated copy itself
+               ["/bin/sh", str(launcher)] if sys.platform == "darwin" and launcher.is_file() else
+               [sys.executable, str(Path(__file__).resolve())])
+        subprocess.Popen(cmd, env={**os.environ, "MUSICXX_UPDATED": "1"})
         sys.exit()
-    for task in (analyzer, syncer, clipboard_watcher, update_tools, watch_busy):
+    restore()
+    if settings.get("phone"):
+        phone(True)
+    for task in (analyzer, dispatcher, syncer, clipboard_watcher, update_tools, watch_busy):
         threading.Thread(target=task, daemon=True).start()
     serving = threading.Thread(target=server.serve_forever, daemon=True)
     serving.start()

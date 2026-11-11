@@ -32,6 +32,11 @@ if __name__ == "__main__":
         other = es.PercivalBpmEstimator()(audio)
         bpm = other if abs(other - bpm) / bpm > 0.03 else bpm
     bpm = fold(bpm)
-    key, scale, _ = es.KeyExtractor(profileType="edma")(audio)  # "edma" profile is tuned for modern electronic/pop
+    key, scale, _ = es.KeyExtractor(profileType="edma")(audio)
+    try:  # integrated loudness (LUFS), for ReplayGain tags; needs the stereo signal
+        stereo, rate = es.AudioLoader(filename=sys.argv[1])()[:2]
+        lufs = round(float(es.LoudnessEBUR128(sampleRate=rate)(stereo)[2]), 1)
+    except Exception:
+        lufs = None  # "edma" profile is tuned for modern electronic/pop
     assert camelot("C", "major") == "8B" and camelot("A", "minor") == "8A" and camelot("E", "major") == "12B" and fold(65) == 130 and fold(190) == 95
-    print(json.dumps({"bpm": round(bpm), "key": f"{key} {scale}", "camelot": camelot(key, scale)}))
+    print(json.dumps({"bpm": round(bpm), "key": f"{key} {scale}", "camelot": camelot(key, scale), "lufs": lufs}))
