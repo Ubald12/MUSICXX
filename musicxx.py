@@ -354,19 +354,19 @@ class Handler(BaseHTTPRequestHandler):
 
 PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MUSICXX</title><link rel="icon" href="/logo.png"><style>
-:root{--bg:#1c1c1e;--bg2:#2c2c2e;--panel:#242426;--hover:#323234;--line:#38383a;--text:#f5f5f7;--muted:#98989d;
+:root{--bg:#1e2124;--bg2:#33373c;--panel:#272a2e;--hover:#31353a;--line:#3b3f45;--text:#f5f5f7;--muted:#98989d;
 --red:#e0362c;--red2:#e0362c;--ok:#30d158;--bad:#ff453a;--sp:#1db954;--yt:#ff3b30;--sc:#ff7700;--shadow:0 4px 16px rgba(0,0,0,.35)}
-@media (prefers-color-scheme:light){:root{--bg:#f5f5f7;--bg2:#e8e8ed;--panel:#fff;--hover:#f0f0f2;--line:#d9d9de;--text:#1d1d1f;--muted:#6e6e73;--ok:#1f9d48;--bad:#d70015;--shadow:0 2px 10px rgba(0,0,0,.08)}}
+:root{color-scheme:dark;--metal:linear-gradient(180deg,#3a3e44,#2a2d32)}
 *{box-sizing:border-box}html,body{height:100%}
-body{margin:0;color:var(--text);background:var(--bg);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;display:flex;flex-direction:column}
+body{margin:0;color:var(--text);background:repeating-linear-gradient(90deg,rgba(255,255,255,.015) 0 1px,transparent 1px 3px),linear-gradient(160deg,#2c3035 0%,#1a1c1f 50%,#26292e 100%) fixed;font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;display:flex;flex-direction:column}
 button{font:inherit;border:0;cursor:pointer;color:inherit;background:none}
 button:focus-visible,textarea:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--red);outline-offset:2px}
 svg.i{width:16px;height:16px;flex:none;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;vertical-align:-3px}
-header{display:flex;align-items:center;gap:12px;padding:10px 20px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
+header{display:flex;align-items:center;gap:12px;padding:10px 20px;border-bottom:1px solid #15171a;background:var(--metal);box-shadow:inset 0 1px rgba(255,255,255,.08);position:sticky;top:0;z-index:5}
 header img{width:26px;height:auto}
 .brand{flex:1;line-height:1.15}.brand b{font-size:15px;letter-spacing:.5px}.brand small{display:block;color:var(--muted);font-size:12px}
 .ghost{display:inline-flex;align-items:center;gap:6px;padding:7px 10px;border-radius:6px;color:var(--muted);font-size:13px}.ghost:hover{background:var(--hover);color:var(--text)}
-main{flex:1;overflow-y:auto}
+main{flex:1;overflow-y:auto}main:focus,#charts:focus,#explore:focus{outline:none}
 #chat{max-width:760px;margin:0 auto;padding:24px 18px 30px;display:flex;flex-direction:column;gap:12px}
 #hero{text-align:center;padding:8vh 10px 10px}
 #hero img{width:84px}
@@ -399,8 +399,8 @@ main{flex:1;overflow-y:auto}
 .more{font-size:12.5px;color:var(--red);padding:6px 4px}
 .actions{display:flex;gap:8px;margin-top:10px}
 .pill{display:inline-flex;align-items:center;gap:6px;padding:6px 11px;border-radius:6px;font-size:13px;font-weight:500;background:var(--bg2);color:var(--text)}.pill:hover{background:var(--hover);box-shadow:inset 0 0 0 1px var(--line)}
-footer{padding:10px 18px 16px;border-top:1px solid var(--line);background:var(--panel)}
-#f{max-width:760px;margin:0 auto;display:flex;align-items:center;gap:8px;padding:5px;border-radius:8px;background:var(--bg);border:1px solid var(--line)}
+footer{padding:10px 18px 16px;border-top:1px solid #15171a;background:var(--metal);box-shadow:inset 0 1px rgba(255,255,255,.08)}
+#f{max-width:760px;margin:0 auto;display:flex;align-items:center;gap:8px;padding:5px;border-radius:8px;background:#1a1c1f;border:1px solid var(--line)}
 #f:focus-within{border-color:var(--muted)}
 textarea{flex:1;font:inherit;border:0;background:none;color:var(--text);resize:none;padding:8px 6px;max-height:120px;height:36px;outline:none!important}
 #detect{margin-left:4px}#detect:empty{display:none}
