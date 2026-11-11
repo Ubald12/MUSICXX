@@ -6,6 +6,7 @@ Paste a Spotify, YouTube or SoundCloud link and get the song as a **.wav** file 
 
 - **Links:** songs, Spotify playlists and albums, YouTube playlists and SoundCloud sets.
 - **🔎 Explore:** search Spotify, YouTube or SoundCloud inside the app, play songs before you download, and filter SoundCloud results by edits, remixes, bootlegs, mashups and sped-up versions.
+- **🎙 Listen:** like Shazam. Play a song near your computer, and MUSICXX recognizes it and downloads it.
 - **🔥 Charts:** the top 100 trending R&B, Afrobeats and US Rap songs, with download-all.
 - **🎹 Key, BPM and genre** for every song you download, including the Camelot code for harmonic mixing.
 
@@ -32,6 +33,7 @@ When it finishes, MUSICXX opens in your web browser, and a **MUSICXX** shortcut 
 
 - **Download a link:** paste it in the box and press Enter. Songs save to **Desktop/OK**.
 - **Explore:** choose a platform, search, and press ▶ to listen or ↓ to download.
+- **Listen:** click **Listen** and allow the microphone. After about 11 seconds, the song is found and downloaded.
 - **Charts:** choose a genre, then download one song or all 100.
 - **Stop MUSICXX:** click **⏻ Quit** at the top right of the page.
 

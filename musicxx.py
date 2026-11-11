@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """MUSICXX: a local chat bot. Paste Spotify / YouTube / SoundCloud links (songs or playlists),
 get .wav files in Desktop/OK. Run: python3 musicxx.py   (self-check: python3 musicxx.py --test)"""
-import csv, glob, html, importlib.util, io, itertools, json, os, queue, re, subprocess, sys, threading, time, webbrowser
+import base64, csv, glob, html, importlib.util, io, itertools, json, os, queue, re, subprocess, sys, tempfile, threading, time, webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qs, quote_plus, urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -66,6 +66,40 @@ for it in Song().query_songs(sys.argv[1], limit=20)["data"]["searchV2"]["tracksV
                 "duration": d["duration"]["totalMilliseconds"] / 1000, "thumb": art[0]["url"] if art else ""})
 print(json.dumps(out))
 '''
+
+
+# Song recognition (Shazam) runs in the Python that has the "shazamio" library
+MAC_VENV_PY = Path.home() / "Library/Application Support/MUSICXX/venv/bin/python"
+RECOGNIZE = r'''
+import asyncio, json, sys
+from shazamio import Shazam
+t = asyncio.run(Shazam().recognize(sys.argv[1])).get("track") or {}
+print(json.dumps({"title": t.get("title", ""), "artist": t.get("subtitle", ""), "cover": (t.get("images") or {}).get("coverart", "")}))
+'''
+
+
+def shazam_python():
+    if not importlib.util.find_spec("shazamio") and sys.prefix != sys.base_prefix:
+        # installed before song recognition existed: self-update brings the code, not the library, so add it once
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "shazamio"])
+        importlib.invalidate_caches()
+    return tool_python("shazamio", MAC_VENV_PY)
+
+
+def recognize(audio):
+    """Identify a short recording (any format ffmpeg reads). {title, artist, cover}, or None if no match."""
+    with tempfile.TemporaryDirectory() as d:
+        src, wav = Path(d, "rec"), Path(d, "rec.wav")
+        src.write_bytes(audio)
+        if subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", str(src), "-ac", "1", "-ar", "16000", str(wav)]).returncode:
+            return None
+        r = subprocess.run([str(shazam_python()), "-I", "-c", RECOGNIZE, str(wav)], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=90)
+    try:
+        hit = json.loads(r.stdout)
+    except ValueError:
+        return None
+    return hit if hit.get("title") else None
 
 
 def search(platform, q):
@@ -145,6 +179,11 @@ def fallback(url):
         artist, title = html.unescape(meta.get("music:musician_description", "")), html.unescape(meta.get("og:title", ""))
     if not title:
         return None
+    return ytmusic(artist, title)
+
+
+def ytmusic(artist, title):
+    """Download the top YouTube Music song result for artist + title."""
     name = f"{artist} - {title}" if artist else title
     search = "https://music.youtube.com/search?q=" + quote_plus(f"{artist} {title}") + "#songs"
     # yt-dlp output templates treat % specially and / as a folder
@@ -253,9 +292,11 @@ def execute(job, cmd):
 
 def run(job):
     code = execute(job, job["cmd"])
-    if not job["saved"] and can_fallback(job["url"], job["log"]):
-        job["log"] = f"{'Spotify' if 'spotify' in job['url'] else 'SoundCloud'} won't give this song. Getting it from YouTube Music…"
-        cmd = fallback(job["url"])
+    retry = job.get("retry")  # a prepared second try (recognized songs), else the per-link fallback
+    if not job["saved"] and (retry or can_fallback(job["url"], job["log"])):
+        job["log"] = ("Trying YouTube Music…" if retry else
+                      f"{'Spotify' if 'spotify' in job['url'] else 'SoundCloud'} won't give this song. Getting it from YouTube Music…")
+        cmd = retry or fallback(job["url"])
         code = execute(job, cmd) if cmd else 1
     job["status"] = "done" if code == 0 or job["saved"] else "failed"
 
@@ -286,7 +327,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/":
             self.send(PAGE, "text/html; charset=utf-8")
         elif self.path == "/jobs":
-            self.send(json.dumps([{k: v for k, v in j.items() if k != "cmd"} for j in jobs]))
+            self.send(json.dumps([{k: v for k, v in j.items() if k not in ("cmd", "retry")} for j in jobs]))
         elif self.path.startswith("/search?"):
             qs = parse_qs(urlsplit(self.path).query)
             platform, q = qs.get("p", [""])[0], qs.get("q", [""])[0].strip()[:200]
@@ -309,8 +350,11 @@ class Handler(BaseHTTPRequestHandler):
         # JSON-only: a random website can't send this cross-origin without a preflight we never answer
         if self.headers.get("Content-Type") != "application/json":
             return self.send('{"error":"json only"}', code=415)
+        size = int(self.headers.get("Content-Length") or 0)
+        if size > 8_000_000:  # a 12-second recording is ~200 KB
+            return self.send('{"error":"too large"}', code=413)
         try:
-            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or "{}")
+            body = json.loads(self.rfile.read(size) or "{}")
             assert isinstance(body, dict)
         except (ValueError, AssertionError):
             return self.send('{"error":"bad request"}', code=400)
@@ -322,6 +366,22 @@ class Handler(BaseHTTPRequestHandler):
             song = OUT / (Path(str(body.get("name", ""))).name + ".wav")
             reveal(song if body.get("name") and song.is_file() else None)
             return self.send("{}")
+        if self.path == "/shazam":
+            try:
+                audio = base64.b64decode(str(body.get("audio", "")), validate=True)
+            except ValueError:
+                return self.send('{"error":"bad audio"}', code=400)
+            hit = recognize(audio)
+            if not hit:
+                return self.send('{"error":"no match"}')
+            # artist/title come from Shazam; strip leading dashes so spotdl can't read them as options
+            name = f"{hit['artist']} - {hit['title']}".lstrip("- ")
+            job = {"id": next(ids), "url": name, "shazam": True, "status": "running", "saved": 0, "songs": [],
+                   "total": 0, "pct": 0, "info": {}, "log": "Finding the song…", "cover": hit["cover"],
+                   "cmd": spotdl(name), "retry": ytmusic(hit["artist"], hit["title"])}
+            threading.Thread(target=run, args=(job,), daemon=True).start()
+            jobs.append(job)
+            return self.send(json.dumps({**hit, "job": job["id"]}))
         if self.path != "/download":
             return self.send("{}", code=404)
         if body.get("chart") in CHARTS:
@@ -469,6 +529,44 @@ nav sup{padding:0 6px;border-radius:9px;background:var(--red);color:#fff;font-si
 #player.show{display:block}body:not(.explore):not(.charts) #player{bottom:110px}
 .ph{display:flex;align-items:center;gap:4px;padding:8px 8px 8px 14px}.ph .ti b{font-size:13.5px}
 #pframe iframe{display:block;width:100%;border:0}
+/* 3D logo */
+#hero .logo3d{perspective:700px;display:inline-block}
+#hero img{animation:spin3d 7s linear infinite;transform-style:preserve-3d;filter:drop-shadow(0 14px 18px rgba(0,0,0,.55))}
+@keyframes spin3d{0%{transform:rotateY(0) rotateX(10deg)}25%{transform:rotateY(90deg) rotateX(0) translateY(-6px)}50%{transform:rotateY(180deg) rotateX(-10deg)}75%{transform:rotateY(270deg) rotateX(0) translateY(-6px)}100%{transform:rotateY(360deg) rotateX(10deg)}}
+header img{animation:sway 5s ease-in-out infinite}@keyframes sway{50%{transform:perspective(200px) rotateY(35deg)}}
+/* Listen (Shazam) */
+.listen{background:var(--red);color:#fff;font-weight:600}.listen:hover{background:var(--red);filter:brightness(1.08);box-shadow:none}
+#hero .listen{padding:9px 16px;font-size:14px}
+#rec{position:fixed;inset:0;z-index:20;display:none;place-items:center;background:rgba(10,11,13,.86)}#rec.show{display:grid}
+#rec .box{text-align:center;width:min(360px,90vw)}
+#rec .orb{position:relative;width:150px;height:150px;margin:0 auto 22px;display:grid;place-items:center;perspective:600px}
+#rec .orb img{width:70px;position:relative;z-index:1;animation:spin3d 2.2s linear infinite}
+#rec .orb i{position:absolute;inset:0;border-radius:50%;border:2px solid var(--red);opacity:0;animation:ring 2.4s ease-out infinite}
+#rec .orb i:nth-child(2){animation-delay:.8s}#rec .orb i:nth-child(3){animation-delay:1.6s}
+@keyframes ring{0%{transform:scale(.45);opacity:.9}100%{transform:scale(1.25);opacity:0}}
+#rec.idle .orb i,#rec.idle .orb img{animation-play-state:paused}
+#rec h2{margin:0 0 4px;font-size:20px;font-weight:600}#rec p{margin:0 0 18px;color:var(--muted)}
+#rec .found{display:flex;align-items:center;gap:12px;text-align:left;margin:0 0 18px;padding:10px;border-radius:10px;background:var(--panel);border:1px solid var(--line)}
+#rec .found img{width:56px;height:56px;border-radius:6px;object-fit:cover}#rec .found:empty{display:none}
+#rec .row2{display:flex;gap:8px;justify-content:center}
+.shz i{background:#08f}
+/* scrolling promo bar */
+#ticker{flex:none;height:34px;overflow:hidden;position:relative;border-top:1px solid #15171a;
+background:repeating-linear-gradient(-45deg,rgba(255,255,255,.035) 0 10px,transparent 10px 20px),linear-gradient(180deg,#2e3136,#1c1e22);background-size:28px 28px,auto;animation:stripes 1.2s linear infinite}
+@keyframes stripes{to{background-position:28px 0,0 0}}
+#ticker .tk{display:flex;width:max-content;height:100%;align-items:center;animation:marq 26s linear infinite}
+#ticker:hover .tk{animation-play-state:paused}
+@keyframes marq{to{transform:translateX(-50%)}}
+#ticker .seg{display:flex;align-items:center;gap:18px;padding-right:18px;white-space:nowrap}
+#ticker b{font-size:12.5px;font-weight:800;letter-spacing:3px;background:linear-gradient(90deg,#d8dbe0,#fff,#9aa0a8);-webkit-background-clip:text;background-clip:text;color:transparent}
+#ticker .eq{display:flex;gap:2px;align-items:flex-end;height:16px}#ticker .eq i{width:3px;background:var(--red);border-radius:1px;animation:eq .9s ease-in-out infinite alternate}
+#ticker .eq i:nth-child(2){animation-delay:-.3s}#ticker .eq i:nth-child(3){animation-delay:-.6s}#ticker .eq i:nth-child(4){animation-delay:-.15s}#ticker .eq i:nth-child(5){animation-delay:-.45s}
+@keyframes eq{from{height:3px}to{height:16px}}
+#ticker .disc{width:18px;height:18px;border-radius:50%;background:radial-gradient(circle,var(--red) 0 3px,#111 3px 4px,transparent 4px),repeating-radial-gradient(circle,#222 0 1px,#3a3d42 1px 2px);animation:spin 2s linear infinite}
+#ticker .dia{width:7px;height:7px;transform:rotate(45deg);background:var(--c)}
+#ticker .wave{width:44px;height:14px;background:linear-gradient(90deg,var(--red) 50%,transparent 0) 0 50%/8px 2px repeat-x;mask:radial-gradient(circle at 4px 50%,#000 3px,transparent 3.5px) 0 0/8px 14px;-webkit-mask:radial-gradient(circle at 4px 50%,#000 3px,transparent 3.5px) 0 0/8px 14px;animation:wv .6s linear infinite}
+@keyframes wv{to{background-position:8px 50%}}
+#toast{bottom:134px}#player{bottom:54px}body:not(.explore):not(.charts) #player{bottom:144px}
 @media (max-width:560px){.brand small,.hint,#folder{display:none}#hero h1{font-size:21px}.genres{grid-template-columns:1fr}.genre{min-height:64px}
 nav button{padding:5px 9px}.grid{grid-template-columns:repeat(2,1fr);gap:10px}#player{right:16px;bottom:16px}}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
@@ -476,10 +574,10 @@ nav button{padding:5px 9px}.grid{grid-template-columns:repeat(2,1fr);gap:10px}#p
 <header><img src="/logo.png" alt=""><div class="brand"><b>MUSICXX</b><small>Spotify · YouTube · SoundCloud → .wav</small></div>
 <nav><button id="tabD" class="on"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12M6 11l6 6 6-6M5 20h14"/></svg>Downloads<sup id="busy"></sup></button><button id="tabE"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>Explore</button><button id="tabC"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>Charts</button></nav>
 <button class="ghost" id="folder"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>Open OK folder</button><button class="ghost" id="quit" title="Stop MUSICXX"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v9M6.3 6.3a8 8 0 1 0 11.4 0"/></svg>Quit</button></header>
-<main id="main"><div id="chat"><div id="hero"><img src="/logo.png" alt="MUSICXX logo"><h1>Drop a link. Get a .wav.</h1>
+<main id="main"><div id="chat"><div id="hero"><span class="logo3d"><img src="/logo.png" alt="MUSICXX logo"></span><h1>Drop a link. Get a .wav.</h1>
 <p>Songs, playlists and albums save straight to <b>Desktop/OK</b>, with their key, BPM and genre.</p>
 <div class="chips"><span class="chip sp"><i></i>Spotify</span><span class="chip yt"><i></i>YouTube</span><span class="chip sc"><i></i>SoundCloud</span></div>
-<p style="margin-top:22px"><button class="pill" data-charts><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>Browse the top 100 R&amp;B, Afrobeats &amp; US Rap</button></p></div></div></main>
+<p style="margin-top:22px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap"><button class="pill listen" data-listen><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>Identify a song playing near you</button><button class="pill" data-charts><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>Browse the top 100 R&amp;B, Afrobeats &amp; US Rap</button></p></div></div></main>
 <section id="charts"><div class="wrap">
 <div class="genres"><button class="genre" data-k="rnb"><b>R&amp;B</b><small>Top 100 worldwide</small></button>
 <button class="genre" data-k="afro"><b>Afrobeats</b><small>Top 100</small></button>
@@ -494,9 +592,13 @@ nav button{padding:5px 9px}.grid{grid-template-columns:repeat(2,1fr);gap:10px}#p
 <button class="ico" id="pdl" title="Download as .wav"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12M6 11l6 6 6-6M5 20h14"/></svg></button><a class="ico" id="popen" target="_blank" rel="noopener" title="Open on the site"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg></a><button class="ico" id="px" title="Close (Esc)"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><div id="pframe"></div></div>
 <div id="toast" role="status"></div>
 <footer><form id="f"><span id="detect"></span><textarea id="t" rows="1" placeholder="Paste a Spotify, YouTube or SoundCloud link…" aria-label="Links"></textarea>
-<button type="button" class="pill" id="paste">Paste</button><button class="send" id="go" disabled><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12M6 11l6 6 6-6M5 20h14"/></svg>Download</button></form>
+<button type="button" class="pill" data-listen title="Listen to a song playing near you and download it"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>Listen</button><button type="button" class="pill" id="paste">Paste</button><button class="send" id="go" disabled><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12M6 11l6 6 6-6M5 20h14"/></svg>Download</button></form>
 <div class="hint">Enter to download · paste several links at once · or drag a link anywhere</div></footer>
 <div id="drop"><div>Drop the link to download</div></div>
+<div id="ticker" aria-hidden="true"><div class="tk"></div></div>
+<div id="rec" role="dialog" aria-modal="true" aria-labelledby="rech"><div class="box"><div class="orb"><i></i><i></i><i></i><img src="/logo.png" alt=""></div>
+<h2 id="rech">Listening…</h2><p id="recp">Hold your computer near the music.</p><div class="found" id="recf"></div>
+<div class="row2"><button class="pill" id="recagain" hidden>Try again</button><button class="pill" id="recx">Cancel</button></div></div></div>
 <script>
 const DL='<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12M6 11l6 6 6-6M5 20h14"/></svg>',OK='<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg>',$=id=>document.getElementById(id),chat=$('chat'),t=$('t'),go=$('go'),detect=$('detect'),main=$('main');
 const cards={},last={},status={},open=new Set();
@@ -520,7 +622,7 @@ function card(j){
   }else if(j.status=='done')head=`<span class="done"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg>${plural(n)} saved to Desktop/OK</span>`;
   else{head=`<span class="failed">✕ Couldn't download${n?' everything ('+plural(n)+' saved)':''}</span>`;meta=esc(j.log)}
   const all=open.has(j.id),list=all?j.songs:j.songs.slice(-5);
-  const src=`<div class="src">${j.chart?'<span class="chip ch">Chart</span>':chip(k)}</div>`;
+  const src=`<div class="src">${j.shazam?'<span class="chip shz"><i></i>Identified by Shazam</span>':j.chart?'<span class="chip ch">Chart</span>':chip(k)}</div>`;
   const songs=list.length?`<ul class="songs">${list.map(s=>`<li><button data-song="${esc(s)}"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg><span>${esc(s)}</span><em>Show file</em></button>${tags(j.info&&j.info[s])}</li>`).join('')}</ul>`+
     (j.songs.length>5?`<button class="more" data-more="${j.id}">${all?'Show less':'Show all '+j.songs.length}</button>`:''):'';
   const acts=j.status=='done'?`<div class="actions"><button class="pill" data-folder><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>Open folder</button></div>`:'';
@@ -706,6 +808,35 @@ addEventListener('dragover',e=>e.preventDefault());
 addEventListener('drop',e=>{e.preventDefault();depth=0;document.body.classList.remove('dragging');
   send(e.dataTransfer.getData('text/uri-list')||e.dataTransfer.getData('text/plain'))});
 addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key=='v'&&document.activeElement!==t&&!/charts|explore/.test(document.body.className))t.focus()});
+// Promo bar: one segment of text + moving graphics, doubled so the scroll loops seamlessly
+{const eq='<span class="eq"><i></i><i></i><i></i><i></i><i></i></span>',d=c=>`<span class="dia" style="--c:${c}"></span>`;
+ const seg=`<span class="seg"><b>DOWNLOAD ALL YOUR FAV TRACKS</b>${eq}${d('var(--sp)')}<span class="disc"></span><b>SPOTIFY · YOUTUBE · SOUNDCLOUD</b>${d('var(--yt)')}<span class="wave"></span>${d('var(--sc)')}${eq}<b>STRAIGHT TO .WAV</b><span class="disc"></span></span>`;
+ $('ticker').firstElementChild.innerHTML=seg.repeat(4)}
+// Listen: record ~11 s from the mic, let Shazam identify it, and the server starts the download
+const REC_SECS=11;let recStream=null,recTimer=null,recCancel=false;
+function recUI(state,h,p,found){const r=$('rec');r.className='show'+(state=='idle'?' idle':'');$('rech').textContent=h;$('recp').textContent=p;
+  $('recf').innerHTML=found||'';$('recagain').hidden=state!='idle';$('recx').textContent=state=='idle'?'Close':'Cancel'}
+function recStop(){clearInterval(recTimer);if(recStream)recStream.getTracks().forEach(t=>t.stop());recStream=null}
+async function listen(){
+  recCancel=false;recUI('rec','Listening…','Allow the microphone if your browser asks.');
+  try{recStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}})}
+  catch(e){return recUI('idle','Microphone blocked','Allow microphone access for this page in your browser settings, then try again.')}
+  const mr=new MediaRecorder(recStream),parts=[];mr.ondataavailable=e=>parts.push(e.data);
+  let left=REC_SECS;$('recp').textContent=`Hold your computer near the music · ${left}s`;
+  recTimer=setInterval(()=>{left--;if(left>0)$('recp').textContent=`Hold your computer near the music · ${left}s`;else mr.stop()},1000);
+  mr.onstop=async()=>{recStop();if(recCancel)return;
+    recUI('rec','Identifying…','Checking with Shazam.');
+    const b64=await new Promise(ok=>{const fr=new FileReader();fr.onload=()=>ok(String(fr.result).split(',')[1]);fr.readAsDataURL(new Blob(parts,{type:mr.mimeType}))});
+    let r;try{r=await (await post('/shazam',{audio:b64})).json()}catch(e){r={error:'offline'}}
+    if(recCancel)return;
+    if(r.error)return recUI('idle',"Couldn't recognize that song",'Try again closer to the speaker, while the song is playing.');
+    recUI('idle','Found it!','Downloading to Desktop/OK.',`${r.cover?`<img src="${esc(r.cover)}" alt="">`:''}<div class="ti"><b>${esc(r.title)}</b><span>${esc(r.artist)}</span></div>`);
+    tab('');poll();setTimeout(()=>{if($('rech').textContent=='Found it!')$('rec').className=''},2500)};
+  mr.start()}
+document.addEventListener('click',e=>{if(e.target.closest('[data-listen]'))listen()});
+$('recagain').onclick=listen;
+$('recx').onclick=()=>{recCancel=true;recStop();$('rec').className=''};
+addEventListener('keydown',e=>{if(e.key=='Escape'&&$('rec').classList.contains('show'))$('recx').click()});
 setInterval(poll,1000);poll();t.focus();if(location.hash=='#charts')tab('charts');else if(location.hash.startsWith('#explore')){tab('explore');  // #explore/[platform/]QUERY searches right away
   let q=decodeURIComponent(location.hash.slice(9));const m=q.match(/^(spotify|youtube|soundcloud)\/(.*)$/);
   if(m){q=m[2];setPlat(m[1])}if(q){$('q').value=q;doSearch()}}
