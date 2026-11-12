@@ -1437,7 +1437,7 @@ background:repeating-linear-gradient(-45deg,rgba(255,255,255,.035) 0 10px,transp
 .syncs li span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.syncs li small{color:var(--muted)}
 .tag.ok{background:color-mix(in srgb,var(--ok) 22%,transparent);color:var(--ok)}.tag.warn{background:color-mix(in srgb,#ff9f0a 22%,transparent);color:#ff9f0a}
 .ltab tr.anchor td{background:color-mix(in srgb,var(--red) 18%,transparent)}.ltab tr.mix td:first-child{box-shadow:inset 3px 0 var(--ok)}.ltab tr.dim{opacity:.35}
-.ltab tbody tr{cursor:default}.lbar .pill{white-space:nowrap}
+.ltab tbody tr{cursor:default}.lwrap{overflow-x:auto}.pill.sm{padding:4px 8px;font-size:12px;margin-right:4px;vertical-align:middle}.lbar .pill{white-space:nowrap}
 #mixbar{display:none;align-items:center;gap:8px;flex-wrap:wrap;margin:-4px 0 12px;padding:10px 12px;border-radius:10px;background:var(--panel);border:1px solid var(--line);font-size:13px}#mixbar.show{display:flex}
 #mixbar b{font-weight:600}#mixbar .sp{flex:1}
 #setlist{display:none;margin:0 0 14px;padding:12px 14px;border-radius:10px;background:var(--panel);border:1px solid var(--line)}#setlist.show{display:block}
@@ -1465,9 +1465,9 @@ nav button{padding:5px 9px}.grid{grid-template-columns:repeat(2,1fr);gap:10px}#p
 <ul class="tracks" id="tracks"></ul></div></section>
 <section id="library"><div class="wrap wide">
 <div class="lbar"><form class="sbox" onsubmit="return false"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="lq" type="search" placeholder="Search your songs by title, artist, genre or key…" aria-label="Search library" autocomplete="off"></form><small id="lcount"></small><button class="pill" id="ldup" hidden></button><button class="pill" id="ltidy" hidden title="Remove doubled artist names and tags like (Official Video) from file names">Tidy names</button><button class="pill" id="lexport" title="Write playlists for Rekordbox, Serato and other DJ apps">Export to DJ apps</button></div>
-<div id="mixbar"><span>Mixes with <b id="mixname"></b>: <span id="mixinfo"></span></span><span class="sp"></span><label class="chk" style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="mixonly">Only matches</label><button class="pill" id="mixset">Suggest a set</button><button class="ico" id="mixx" title="Clear"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>
+<div id="mixbar"><span>Mixes with <b id="mixname"></b>: <span id="mixinfo"></span></span><span class="sp"></span><label class="chk" style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="mixonly">Only matches</label><button class="pill" id="mixintro" title="Make a DJ version with 16 bars of beat before the vocal">+ 16-bar intro</button><button class="pill" id="mixset">Suggest a set</button><button class="ico" id="mixx" title="Clear"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>
 <div id="setlist"><b>Suggested set</b> <small class="mut">each song mixes into the next (compatible key, BPM within 6%)</small><ol id="setol"></ol><button class="pill" id="setsave">Save as playlist for DJ apps</button></div>
-<table class="ltab"><thead><tr><th data-s="title">Title</th><th data-s="camelot">Key</th><th data-s="bpm">BPM</th><th data-s="genre">Genre</th><th data-s="ext">Format</th><th data-s="added" class="on">Added</th><th></th></tr></thead><tbody id="lrows"></tbody></table>
+<div class="lwrap"><table class="ltab"><thead><tr><th data-s="title">Title</th><th data-s="camelot">Key</th><th data-s="bpm">BPM</th><th data-s="genre">Genre</th><th data-s="ext">Format</th><th data-s="added" class="on">Added</th><th></th></tr></thead><tbody id="lrows"></tbody></table></div>
 <div class="empty" id="lempty" hidden>No songs yet. Everything you download shows up here.</div></div></section>
 <section id="explore"><div class="wrap">
 <div class="plats"><button class="plat" data-p="spotify"><i></i>Spotify</button><button class="plat" data-p="youtube"><i></i>YouTube</button><button class="plat" data-p="soundcloud"><i></i>SoundCloud</button></div>
@@ -1712,7 +1712,7 @@ function renderLib(){
   const dups=lib.filter(s=>s.dup).length,messy=lib.filter(s=>s.messy).length;
   $('ldup').hidden=!dups&&!dupOnly;$('ldup').textContent=dupOnly?'Show all songs':`${dups} possible duplicates`;$('ldup').classList.toggle('on',dupOnly);
   $('ltidy').hidden=!messy;$('ltidy').textContent=`Tidy ${messy} file name${messy==1?'':'s'}`;
-  $('mixbar').classList.toggle('show',!!A);
+  $('mixbar').classList.toggle('show',!!A);$('mixintro').hidden=!A||/\(16 Bar Intro\)$/.test(A.name);
   if(A){$('mixname').textContent=A.title;$('mixinfo').textContent=`${A.camelot||'?'} · ${A.bpm||'?'} BPM · ${lib.filter(s=>mixes(A,s)).length} songs`}
   const v=s=>lsort=='camelot'?(s.camelot?parseInt(s.camelot)*2+(s.camelot.endsWith('B')?1:0):99):s[lsort]??'';
   rows.sort((a,b)=>{const x=v(a),y=v(b);const c=typeof x=='number'&&typeof y=='number'?x-y:String(x).localeCompare(String(y));return lasc?c:-c});
@@ -1722,12 +1722,14 @@ function renderLib(){
   $('lrows').innerHTML=rows.map(s=>`<tr data-row="${esc(s.file)}" class="${lplaying==s.file?'playing ':''}${A?(s==A?'anchor':mixes(A,s)?'mix':'dim'):''}" title="Click to see which songs mix with this one"><td><div class="tt">${s.cover?`<img src="${esc(small(s.cover))}" alt="" loading="lazy">`:'<span class="ph0"></span>'}<div style="min-width:0"><b>${esc(s.title)}</b><span>${esc(s.artist)}${s.dup?' · <span style="color:#ff9f0a">duplicate?</span>':''}</span></div></div></td>
   <td>${s.camelot?`<b class="tag cam" style="--h:${(parseInt(s.camelot)-1)*30}">${esc(s.camelot)}</b> <span class="mut">${esc(s.key)}</span>`:s.state=='analyzing'?'<span class="mut">Analyzing…</span>':''}</td>
   <td class="num" title="${s.lufs!=null?'Loudness '+s.lufs+' LUFS':''}">${s.bpm||''}</td><td class="mut">${esc(s.genre||'')}</td><td class="mut">${esc(s.ext)}</td><td class="mut num">${new Date(s.added*1000).toLocaleDateString()}</td>
-  <td class="acts">${/\(16 Bar Intro\)$/.test(s.name)?'':`<button class="ico" data-lintro="${esc(s.file)}" title="Make a DJ version with a 16-bar intro before the vocal">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h4M4 8v8M10 6v12M14 9v6M18 4v16"/></svg>'}</button>`}<button class="ico" data-lstems="${esc(s.file)}" title="Split into vocals, drums, bass and other">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h10M4 17h6"/></svg>'}</button><button class="ico" data-lplay="${esc(s.file)}" title="Play">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4l13 8-13 8z"/></svg>'}</button><button class="ico" data-lshow="${esc(s.name)}" title="Show in folder">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>'}</button></td></tr>`).join('')}
+  <td class="acts">${/\(16 Bar Intro\)$/.test(s.name)?'':`<button class="pill sm" data-lintro="${esc(s.file)}" title="Make a DJ version with 16 bars of beat before the vocal">+ 16-bar intro</button>`}<button class="ico" data-lstems="${esc(s.file)}" title="Split into vocals, drums, bass and other">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h10M4 17h6"/></svg>'}</button><button class="ico" data-lplay="${esc(s.file)}" title="Play">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4l13 8-13 8z"/></svg>'}</button><button class="ico" data-lshow="${esc(s.name)}" title="Show in folder">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>'}</button></td></tr>`).join('')}
 $('lq').oninput=renderLib;
 document.querySelector('.ltab thead').onclick=e=>{const th=e.target.closest('th[data-s]');if(!th)return;
   if(lsort==th.dataset.s)lasc=!lasc;else{lsort=th.dataset.s;lasc=/title|genre|camelot|ext/.test(lsort)}renderLib()};
+function addIntro(file){post('/intro',{name:file}).then(r=>r.ok?(tab(''),toast('Adding a 16-bar intro…'),poll()):toast('16-bar intros aren\'t available for this song on this computer'))}
+$('mixintro').onclick=()=>anchor&&addIntro(anchor);
 $('lrows').onclick=e=>{const p=e.target.closest('[data-lplay]'),f=e.target.closest('[data-lshow]'),st=e.target.closest('[data-lstems]'),it=e.target.closest('[data-lintro]');
-  if(it){post('/intro',{name:it.dataset.lintro}).then(r=>r.ok?(tab(''),toast('Adding a 16-bar intro…'),poll()):toast('16-bar intros aren\'t available on this computer'));return}
+  if(it){addIntro(it.dataset.lintro);return}
   if(st){if(confirm('Split this song into vocals, drums, bass and other?\n\nTakes about a minute per song. The first time, MUSICXX also downloads the separation tool (about 1 GB).'))
     post('/stems',{name:st.dataset.lstems}).then(r=>r.ok?(tab(''),toast('Separating stems…'),poll()):toast('Stem separation isn\'t available on this computer'));return}
   if(!p&&!f){const r=e.target.closest('[data-row]');if(r){anchor=anchor==r.dataset.row?null:r.dataset.row;$('setlist').classList.remove('show');renderLib()}return}
