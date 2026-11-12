@@ -1,6 +1,7 @@
-"""Give a song a 16-bar DJ intro: 16 bars of its own beat (vocals removed) before the vocal comes in.
+"""DJ edits of a song: a 16-bar intro (16 bars of its own beat, vocals removed, before the vocal comes in) or a
+vocal outro (the last 16 bars with singing play as the isolated vocals, then the song ends).
 Runs in the Python that has essentia; Demucs runs in the Python given as the third argument.
-Usage: python intro.py song.wav "song (16 Bar Intro).wav" /path/to/python-with-demucs"""
+Usage: python intro.py song.wav "song (16 Bar Intro).wav" /path/to/python-with-demucs [intro|outro]"""
 import subprocess, sys, tempfile
 from pathlib import Path
 import numpy as np
@@ -37,6 +38,22 @@ def build(song, nv, beats, start):
     return np.concatenate([intro, rest]), v
 
 
+def outro(song, vocals, beats, end):
+    """The song until 16 bars before the last vocal, then only the vocals for those 16 bars (plus a beat to ring out)."""
+    e = int(np.searchsorted(beats, end))  # first beat after the singing stops
+    if e < 4 * BARS:
+        return None
+    a = int(round(beats[e - 4 * BARS] * RATE))
+    beat = int(round(np.median(np.diff(beats)) * RATE))
+    b = min(len(vocals), int(round(beats[min(e, len(beats) - 1)] * RATE)) + beat)
+    tail = vocals[a:b].copy()
+    fade = 441
+    ramp = np.linspace(0, 1, fade)[:, None]
+    tail[:fade] = tail[:fade] * ramp + song[a:a + fade] * (1 - ramp)
+    tail[-beat:] *= np.linspace(1, 0, beat)[:, None] if beat <= len(tail) else 1
+    return np.concatenate([song[:a], tail])
+
+
 def check():
     beats = np.arange(0, 120, 0.5)  # 120 BPM, 2 s bars
     song = np.random.default_rng(0).normal(0, 0.1, (60 * RATE, 2)).astype(np.float32)
@@ -45,11 +62,15 @@ def check():
     vox = np.zeros(30 * RATE, np.float32)
     vox[10 * RATE:] = np.sin(np.arange(20 * RATE) * 0.05)
     assert abs(vocal_start(vox, 0.5) - 10) < 0.2
+    assert abs(30 - vocal_start(vox[::-1], 0.5) - 30) < 0.2  # vocal end, found by reading backwards
+    out = outro(song, song * 0.5, beats, 50.2)  # singing stops at 50.2 s: next beat is 50.5, 16 bars before is 18.5
+    assert len(out) == int(18.5 * RATE) + int(32.5 * RATE) and np.allclose(out[20 * RATE], song[20 * RATE] * 0.5)
 
 
 if __name__ == "__main__":
     check()
     song, out, demucs_py = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+    mode = sys.argv[4] if len(sys.argv) > 4 else "intro"
     audio, rate = es.AudioLoader(filename=str(song))()[:2]
     if rate != RATE:
         audio = np.stack([es.Resample(inputSampleRate=rate, outputSampleRate=RATE)(np.ascontiguousarray(audio[:, c]))
@@ -64,9 +85,19 @@ if __name__ == "__main__":
         nv = es.AudioLoader(filename=str(stems / "no_vocals.wav"))()[0]
     n = min(len(audio), len(nv))
     audio, nv = audio[:n], nv[:n]
-    start = vocal_start(vocals[:n].mean(1), float(np.median(np.diff(beats))))
+    mono, beat = vocals[:n].mean(1), float(np.median(np.diff(beats)))
+    start = vocal_start(mono, beat)
     if start is None:
-        sys.exit("No vocals found in this song, so it doesn't need an intro.")
+        sys.exit("No vocals found in this song.")
+    if mode == "outro":
+        end = n / RATE - vocal_start(mono[::-1], beat)
+        mixed = outro(audio, vocals[:n], beats, end)
+        if mixed is None:
+            sys.exit("The vocals in this song are too short for a 16-bar outro.")
+        print(f"Vocals end at {end:.1f} s. Writing the vocal outro…", flush=True)
+        es.AudioWriter(filename=str(out), format=out.suffix[1:], sampleRate=RATE)(np.ascontiguousarray(mixed, np.float32))
+        print(f"Outro saved: {out.name}", flush=True)
+        sys.exit()
     mixed, v = build(audio, nv, beats, start)
     if mixed is None:
         sys.exit("The vocal starts too late in this song to add an intro.")

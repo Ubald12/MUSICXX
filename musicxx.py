@@ -414,7 +414,7 @@ def clean_name(stem):
 def song_key(stem):
     """Same song regardless of features, brackets, case and punctuation: used to spot duplicates."""
     artist, _, title = stem.partition(" - ")
-    title = re.sub(r"[(\[](?!16 Bar Intro).*?[)\]]|\bfeat\..*", "", title or artist)  # an intro edit isn't a duplicate
+    title = re.sub(r"[(\[](?!16 Bar Intro|Vocal Outro).*?[)\]]|\bfeat\..*", "", title or artist)  # an intro edit isn't a duplicate
     return re.sub(r"\W+", "", re.split(r",|&| x | feat", artist)[0].lower()) + "|" + re.sub(r"\W+", "", title.lower())
 
 
@@ -726,8 +726,14 @@ def stems(name):
 INTRO = Path(__file__).with_name("intro.py")
 
 
-def add_intro(name):
-    """A DJ version with 16 bars of the song's own beat before the vocal, saved as "<song> (16 Bar Intro)"."""
+EDITS = {"intro": "16 Bar Intro", "outro": "Vocal Outro"}
+
+
+def add_intro(name, kind="intro"):
+    """A DJ version: "intro" = 16 bars of the song's own beat before the vocal, saved as "<song> (16 Bar Intro)";
+    "outro" = the last 16 bars with singing as isolated vocals, saved as "<song> (Vocal Outro)"."""
+    if kind not in EDITS:
+        return None
     if not INTRO.is_file():  # installs older than this feature only self-update the files they knew about
         try:
             code = fetch(f"https://raw.githubusercontent.com/{REPO}/main/intro.py")
@@ -741,11 +747,11 @@ def add_intro(name):
     if not found or not VENV_PY.exists():  # needs essentia for the beat grid (not on Windows)
         return None
     f, pre = found
-    if f.stem.endswith("(16 Bar Intro)"):
+    if f"({EDITS[kind]})" in f.stem:
         return None
-    out = f.with_name(f"{f.stem} (16 Bar Intro){f.suffix}")
-    return start(f"16-bar intro · {f.stem}", [str(VENV_PY), "-I", str(INTRO), str(f), str(out), sys.executable],
-                 intro=str(out), pre=pre)
+    out = f.with_name(f"{f.stem} ({EDITS[kind]}){f.suffix}")
+    return start(f"{EDITS[kind]} · {f.stem}", [str(VENV_PY), "-I", str(INTRO), str(f), str(out), sys.executable, kind],
+                 intro=str(out), kind=kind, pre=pre)
 
 
 def notify(title, text):
@@ -977,7 +983,7 @@ class Handler(BaseHTTPRequestHandler):
             job = stems(str(body.get("name", "")))
             return self.send(json.dumps({"job": job["id"]} if job else {"error": "unavailable"}), code=200 if job else 400)
         if self.path == "/intro":
-            job = add_intro(str(body.get("name", "")))
+            job = add_intro(str(body.get("name", "")), str(body.get("kind", "intro")))
             return self.send(json.dumps({"job": job["id"]} if job else {"error": "unavailable"}), code=200 if job else 400)
         if self.path == "/export":
             return self.send(json.dumps(export_all()))
@@ -992,7 +998,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(json.dumps({"renamed": tidy_library()}))
         if self.path == "/retry" and job and job["status"] in ("failed", "cancelled"):
             new = start(job["url"], command(job["url"]) or job["cmd"],
-                        **{k: job[k] for k in ("chart", "shazam", "cover", "retry", "total", "sync", "stems", "intro", "pre") if k in job})
+                        **{k: job[k] for k in ("chart", "shazam", "cover", "retry", "total", "sync", "stems", "intro", "kind", "pre") if k in job})
             return self.send(json.dumps([new["id"]]))
         if self.path == "/settings":
             return self.send(json.dumps(update_settings(body)))
@@ -1465,7 +1471,7 @@ nav button{padding:5px 9px}.grid{grid-template-columns:repeat(2,1fr);gap:10px}#p
 <ul class="tracks" id="tracks"></ul></div></section>
 <section id="library"><div class="wrap wide">
 <div class="lbar"><form class="sbox" onsubmit="return false"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="lq" type="search" placeholder="Search your songs by title, artist, genre or key…" aria-label="Search library" autocomplete="off"></form><small id="lcount"></small><button class="pill" id="ldup" hidden></button><button class="pill" id="ltidy" hidden title="Remove doubled artist names and tags like (Official Video) from file names">Tidy names</button><button class="pill" id="lexport" title="Write playlists for Rekordbox, Serato and other DJ apps">Export to DJ apps</button></div>
-<div id="mixbar"><span>Mixes with <b id="mixname"></b>: <span id="mixinfo"></span></span><span class="sp"></span><label class="chk" style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="mixonly">Only matches</label><button class="pill" id="mixintro" title="Make a DJ version with 16 bars of beat before the vocal">+ 16-bar intro</button><button class="pill" id="mixset">Suggest a set</button><button class="ico" id="mixx" title="Clear"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>
+<div id="mixbar"><span>Mixes with <b id="mixname"></b>: <span id="mixinfo"></span></span><span class="sp"></span><label class="chk" style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="mixonly">Only matches</label><button class="pill" id="mixintro" title="Make a DJ version with 16 bars of beat before the vocal">+ 16-bar intro</button><button class="pill" id="mixoutro" title="Make a DJ version whose last 16 bars with singing are the vocals only">+ Vocal outro</button><button class="pill" id="mixset">Suggest a set</button><button class="ico" id="mixx" title="Clear"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>
 <div id="setlist"><b>Suggested set</b> <small class="mut">each song mixes into the next (compatible key, BPM within 6%)</small><ol id="setol"></ol><button class="pill" id="setsave">Save as playlist for DJ apps</button></div>
 <div class="lwrap"><table class="ltab"><thead><tr><th data-s="title">Title</th><th data-s="camelot">Key</th><th data-s="bpm">BPM</th><th data-s="genre">Genre</th><th data-s="ext">Format</th><th data-s="added" class="on">Added</th><th></th></tr></thead><tbody id="lrows"></tbody></table></div>
 <div class="empty" id="lempty" hidden>No songs yet. Everything you download shows up here.</div></div></section>
@@ -1513,7 +1519,7 @@ function card(j){
   const n=j.saved,k=kind(j.url);let head,bar='',meta='';
   if(j.status=='queued')head=`<span class="cancelled">Waiting in line…</span><button class="ico x" data-cancel="${j.id}" title="Remove from the queue">${X}</button>`,meta=esc(j.log||'');
   else if(j.status=='running'){
-    head=`<span class="spin"></span>${j.stems?'Separating stems…':j.intro?'Adding a 16-bar intro…':'Downloading…'}<button class="ico x" data-cancel="${j.id}" title="Cancel">${X}</button>`;
+    head=`<span class="spin"></span>${j.stems?'Separating stems…':j.intro?(j.kind=='outro'?'Making a vocal outro…':'Adding a 16-bar intro…'):'Downloading…'}<button class="ico x" data-cancel="${j.id}" title="Cancel">${X}</button>`;
     const p=j.total?Math.min(100,n/j.total*100):j.pct;
     bar=`<div class="bar ${p?'':'indef'}"><i style="width:${p}%"></i></div>`;
     meta=(j.total?`${n} / ${j.total} songs`:j.pct?`${j.pct.toFixed(0)}%`:'')+(j.log?' · '+esc(j.log):'');
@@ -1523,7 +1529,7 @@ function card(j){
   else{head=`<span class="failed">✕ Couldn't download${n?' everything ('+plural(n)+' saved)':''}</span>`;meta=esc(j.log)}
   const all=open.has(j.id),list=all?j.songs:j.songs.slice(-5);
   const cover=j.cover||Object.values(j.info||{}).map(i=>i.cover).find(Boolean);
-  const src=`<div class="src">${cover?`<img class="cv" src="${esc(small(cover))}" alt="">`:''}${j.stems?'<span class="chip">Stems</span>':j.intro?'<span class="chip">16-bar intro</span>':j.shazam?'<span class="chip shz"><i></i>Identified by Shazam</span>':j.chart?'<span class="chip ch">Chart</span>':chip(k)}${j.sync?'<span class="chip syn"><i></i>Synced playlist</span>':''}</div>`;
+  const src=`<div class="src">${cover?`<img class="cv" src="${esc(small(cover))}" alt="">`:''}${j.stems?'<span class="chip">Stems</span>':j.intro?`<span class="chip">${j.kind=='outro'?'Vocal outro':'16-bar intro'}</span>`:j.shazam?'<span class="chip shz"><i></i>Identified by Shazam</span>':j.chart?'<span class="chip ch">Chart</span>':chip(k)}${j.sync?'<span class="chip syn"><i></i>Synced playlist</span>':''}</div>`;
   const songs=list.length?`<ul class="songs">${list.map(s=>`<li><button data-song="${esc(s)}">${j.info&&j.info[s]&&j.info[s].cover?`<img src="${esc(small(j.info[s].cover))}" alt="">`:'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>'}<span>${esc(s)}</span><em>Show file</em></button>${tags(j.info&&j.info[s])}</li>`).join('')}</ul>`+
     (j.songs.length>5?`<button class="more" data-more="${j.id}">${all?'Show less':'Show all '+j.songs.length}</button>`:''):'';
   const pl=k&&/Playlist|Album/.test(k[2])&&!j.chart,on=cfg.syncs.some(e=>e.url==j.url);
@@ -1712,7 +1718,7 @@ function renderLib(){
   const dups=lib.filter(s=>s.dup).length,messy=lib.filter(s=>s.messy).length;
   $('ldup').hidden=!dups&&!dupOnly;$('ldup').textContent=dupOnly?'Show all songs':`${dups} possible duplicates`;$('ldup').classList.toggle('on',dupOnly);
   $('ltidy').hidden=!messy;$('ltidy').textContent=`Tidy ${messy} file name${messy==1?'':'s'}`;
-  $('mixbar').classList.toggle('show',!!A);$('mixintro').hidden=!A||/\(16 Bar Intro\)$/.test(A.name);
+  $('mixbar').classList.toggle('show',!!A);$('mixintro').hidden=!A||/\(16 Bar Intro\)/.test(A.name);$('mixoutro').hidden=!A||/\(Vocal Outro\)/.test(A.name);
   if(A){$('mixname').textContent=A.title;$('mixinfo').textContent=`${A.camelot||'?'} · ${A.bpm||'?'} BPM · ${lib.filter(s=>mixes(A,s)).length} songs`}
   const v=s=>lsort=='camelot'?(s.camelot?parseInt(s.camelot)*2+(s.camelot.endsWith('B')?1:0):99):s[lsort]??'';
   rows.sort((a,b)=>{const x=v(a),y=v(b);const c=typeof x=='number'&&typeof y=='number'?x-y:String(x).localeCompare(String(y));return lasc?c:-c});
@@ -1722,14 +1728,16 @@ function renderLib(){
   $('lrows').innerHTML=rows.map(s=>`<tr data-row="${esc(s.file)}" class="${lplaying==s.file?'playing ':''}${A?(s==A?'anchor':mixes(A,s)?'mix':'dim'):''}" title="Click to see which songs mix with this one"><td><div class="tt">${s.cover?`<img src="${esc(small(s.cover))}" alt="" loading="lazy">`:'<span class="ph0"></span>'}<div style="min-width:0"><b>${esc(s.title)}</b><span>${esc(s.artist)}${s.dup?' · <span style="color:#ff9f0a">duplicate?</span>':''}</span></div></div></td>
   <td>${s.camelot?`<b class="tag cam" style="--h:${(parseInt(s.camelot)-1)*30}">${esc(s.camelot)}</b> <span class="mut">${esc(s.key)}</span>`:s.state=='analyzing'?'<span class="mut">Analyzing…</span>':''}</td>
   <td class="num" title="${s.lufs!=null?'Loudness '+s.lufs+' LUFS':''}">${s.bpm||''}</td><td class="mut">${esc(s.genre||'')}</td><td class="mut">${esc(s.ext)}</td><td class="mut num">${new Date(s.added*1000).toLocaleDateString()}</td>
-  <td class="acts">${/\(16 Bar Intro\)$/.test(s.name)?'':`<button class="pill sm" data-lintro="${esc(s.file)}" title="Make a DJ version with 16 bars of beat before the vocal">+ 16-bar intro</button>`}<button class="ico" data-lstems="${esc(s.file)}" title="Split into vocals, drums, bass and other">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h10M4 17h6"/></svg>'}</button><button class="ico" data-lplay="${esc(s.file)}" title="Play">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4l13 8-13 8z"/></svg>'}</button><button class="ico" data-lshow="${esc(s.name)}" title="Show in folder">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>'}</button></td></tr>`).join('')}
+  <td class="acts">${/\(16 Bar Intro\)/.test(s.name)?'':`<button class="pill sm" data-lintro="${esc(s.file)}" title="Make a DJ version with 16 bars of beat before the vocal">+ 16-bar intro</button>`}${/\(Vocal Outro\)/.test(s.name)?'':`<button class="pill sm" data-loutro="${esc(s.file)}" title="Make a DJ version whose last 16 bars with singing are the vocals only">+ Vocal outro</button>`}<button class="ico" data-lstems="${esc(s.file)}" title="Split into vocals, drums, bass and other">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h10M4 17h6"/></svg>'}</button><button class="ico" data-lplay="${esc(s.file)}" title="Play">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4l13 8-13 8z"/></svg>'}</button><button class="ico" data-lshow="${esc(s.name)}" title="Show in folder">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>'}</button></td></tr>`).join('')}
 $('lq').oninput=renderLib;
 document.querySelector('.ltab thead').onclick=e=>{const th=e.target.closest('th[data-s]');if(!th)return;
   if(lsort==th.dataset.s)lasc=!lasc;else{lsort=th.dataset.s;lasc=/title|genre|camelot|ext/.test(lsort)}renderLib()};
-function addIntro(file){post('/intro',{name:file}).then(r=>r.ok?(tab(''),toast('Adding a 16-bar intro…'),poll()):toast('16-bar intros aren\'t available for this song on this computer'))}
-$('mixintro').onclick=()=>anchor&&addIntro(anchor);
-$('lrows').onclick=e=>{const p=e.target.closest('[data-lplay]'),f=e.target.closest('[data-lshow]'),st=e.target.closest('[data-lstems]'),it=e.target.closest('[data-lintro]');
+function addIntro(file,kind='intro'){const w=kind=='outro'?'Vocal outros':'16-bar intros';
+  post('/intro',{name:file,kind}).then(r=>r.ok?(tab(''),toast(kind=='outro'?'Making a vocal outro…':'Adding a 16-bar intro…'),poll()):toast(w+' aren\'t available for this song on this computer'))}
+$('mixintro').onclick=()=>anchor&&addIntro(anchor);$('mixoutro').onclick=()=>anchor&&addIntro(anchor,'outro');
+$('lrows').onclick=e=>{const p=e.target.closest('[data-lplay]'),f=e.target.closest('[data-lshow]'),st=e.target.closest('[data-lstems]'),it=e.target.closest('[data-lintro]'),ot=e.target.closest('[data-loutro]');
   if(it){addIntro(it.dataset.lintro);return}
+  if(ot){addIntro(ot.dataset.loutro,'outro');return}
   if(st){if(confirm('Split this song into vocals, drums, bass and other?\n\nTakes about a minute per song. The first time, MUSICXX also downloads the separation tool (about 1 GB).'))
     post('/stems',{name:st.dataset.lstems}).then(r=>r.ok?(tab(''),toast('Separating stems…'),poll()):toast('Stem separation isn\'t available on this computer'));return}
   if(!p&&!f){const r=e.target.closest('[data-row]');if(r){anchor=anchor==r.dataset.row?null:r.dataset.row;$('setlist').classList.remove('show');renderLib()}return}
@@ -1905,7 +1913,7 @@ def self_test():
     assert clean_name("Gradur - GRADUR - DÉCENNIE (VIZUALISER)") == "Gradur - DÉCENNIE"
     assert clean_name("Tems - Free Mind (Official Video)") == "Tems - Free Mind" and clean_name("A - B (Remix)") == "A - B (Remix)"
     assert song_key("Victony, BNXN - WHO THIS (feat. BNXN)") == song_key("Victony - Who This")
-    assert song_key("A - B (16 Bar Intro)") != song_key("A - B")
+    assert song_key("A - B (16 Bar Intro)") != song_key("A - B") != song_key("A - B (Vocal Outro)")
     job = {"songs": [], "saved": 0, "total": 0, "pct": 0, "info": {}}
     for line in ["INFO Found 12 songs in My Mix (Playlist)", "DEBUG [x] Best ISRC result is https://y/1 with score 99",
                  "DEBUG Downloading A - B using https://y/1", "DEBUG [z] Returning best result https://y/2 with score 77",
