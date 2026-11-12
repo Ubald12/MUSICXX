@@ -294,7 +294,7 @@ TOTAL = re.compile(r"Downloading item \d+ of (\d+)|^\d+/(\d+) complete")
 PCT = re.compile(r"^\[download\]\s+([\d.]+)%|(\d+(?:\.\d+)?)%\|")  # yt-dlp, or a tqdm bar (stem separation)
 ISRC = re.compile(r"Returning only ISRC result (\S+)|Best ISRC result is (\S+)")
 USING = re.compile(r"Downloading (.+) using (\S+)")
-SCORE = re.compile(r"Returning best result (\S+) with score ([\d.]+)")
+SCORE = re.compile(r"Returning (?:verified )?best result (\S+) with score ([\d.]+)")
 LISTNAME = re.compile(r"Found \d+ songs in (.+) \((?:Playlist|Album)\)|\[download\] Downloading playlist: (.+)")
 FORMAT = re.compile(r"Downloading 1 format\(s\): (\S+)")
 # what YouTube / SoundCloud actually serve; a WAV can't be better than this
@@ -1965,7 +1965,7 @@ def self_test():
     assert song_key("A - B (16 Bar Intro)") != song_key("A - B") != song_key("A - B (Vocal Outro)")
     job = {"songs": [], "saved": 0, "total": 0, "pct": 0, "info": {}}
     for line in ["INFO Found 12 songs in My Mix (Playlist)", "DEBUG [x] Best ISRC result is https://y/1 with score 99",
-                 "DEBUG Downloading A - B using https://y/1", "DEBUG [z] Returning best result https://y/2 with score 77",
+                 "DEBUG Downloading A - B using https://y/1", "DEBUG [z] Returning verified best result https://y/2 with score 77",
                  "DEBUG Downloading C - D using https://y/2", "[info] abc: Downloading 1 format(s): 251"]:
         parse(job, line)
     assert job["playlist"] == "My Mix" and job["matches"] == {"A - B": "exact", "C - D": 77} and job["kbps"] == 160, job
