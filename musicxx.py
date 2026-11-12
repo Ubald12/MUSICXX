@@ -728,8 +728,17 @@ INTRO = Path(__file__).with_name("intro.py")
 
 def add_intro(name):
     """A DJ version with 16 bars of the song's own beat before the vocal, saved as "<song> (16 Bar Intro)"."""
+    if not INTRO.is_file():  # installs older than this feature only self-update the files they knew about
+        try:
+            code = fetch(f"https://raw.githubusercontent.com/{REPO}/main/intro.py")
+            compile(code, "intro.py", "exec")
+            if not code.strip():  # offline
+                return None
+            INTRO.write_text(code, encoding="utf-8")
+        except (SyntaxError, ValueError, OSError):
+            return None
     found = demucs_song(name)
-    if not found or not VENV_PY.exists() or not INTRO.is_file():  # needs essentia for the beat grid (not on Windows)
+    if not found or not VENV_PY.exists():  # needs essentia for the beat grid (not on Windows)
         return None
     f, pre = found
     if f.stem.endswith("(16 Bar Intro)"):
