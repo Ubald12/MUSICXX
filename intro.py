@@ -24,18 +24,42 @@ def vocal_start(vocals, beat):
     return None
 
 
+def rms(x):
+    return float(np.sqrt(np.mean(x ** 2))) + 1e-9
+
+
+def limit(x, ceiling=0.98):
+    """Peak limiter: 10 ms blocks, each block's gain also capped by its neighbours' and then interpolated, so no
+    sample goes over the ceiling and the gain never jumps (no clicks)."""
+    blk = RATE // 100
+    n = -(-len(x) // blk)
+    peaks = np.abs(np.pad(x, ((0, n * blk - len(x)), (0, 0)))).reshape(n, -1).max(1)
+    g = np.minimum(1, ceiling / np.maximum(peaks, 1e-9))
+    g = np.minimum(g, np.minimum(np.r_[g[1:], 1], np.r_[1, g[:-1]]))
+    gain = np.interp(np.arange(len(x)), np.arange(n) * blk + blk / 2, g)
+    return x * gain[:, None]
+
+
 def build(song, nv, beats, start):
-    """16 bars of instrumental from the vocal entry, then the song from that same beat: a 64-beat phrase loop, so
-    the join is musically seamless even when the vocal enters on a pickup rather than the downbeat."""
+    """16 bars of the song's own beat (vocals removed), then the whole original song untouched.
+    The beat is taken from the first 4-bar boundary at or after the vocal entry, so it has the full drums, and it's
+    raised to the loudness the song has in those same bars (removing vocals makes it quieter)."""
     v = int(np.argmin(np.abs(beats - start)))
-    if v + 4 * BARS >= len(beats):
+    k = -(-v // 16) * 16  # counted from the song's first beat, so the jump back to beat 1 lands on the bar grid
+    if k + 4 * BARS >= len(beats):
         return None, 0
-    a, b = (int(round(beats[i] * RATE)) for i in (v, v + 4 * BARS))
-    fade = 441  # 10 ms
-    intro, rest = nv[a:b].copy(), song[a:].copy()
-    ramp = np.linspace(0, 1, fade)[:, None]
-    rest[:fade] = rest[:fade] * ramp + nv[b:b + fade] * (1 - ramp)  # the beat carries on under the first vocal
-    return np.concatenate([intro, rest]), v
+    a, b = (int(round(beats[i] * RATE)) for i in (k, k + 4 * BARS))
+    intro = nv[a:b].copy()
+    for _ in range(2):  # the limiter takes a little loudness back: correct once more
+        intro = limit(intro * (rms(song[a:b]) / rms(intro)))
+    fade = 441  # 10 ms in, so the file doesn't start with a click
+    intro[:fade] *= np.linspace(0, 1, fade)[:, None]
+    # the song's first beat lands one beat after the intro's last; anything before it (a pickup) plays over the intro
+    lead = min(int(round(beats[0] * RATE)), len(intro))
+    out = np.zeros((len(intro) - lead + len(song), song.shape[1]), np.float32)
+    out[:len(intro)] = intro
+    out[len(intro) - lead:] += song
+    return np.clip(out, -1, 1), k
 
 
 def outro(song, vocals, beats, end):
@@ -57,8 +81,12 @@ def outro(song, vocals, beats, end):
 def check():
     beats = np.arange(0, 120, 0.5)  # 120 BPM, 2 s bars
     song = np.random.default_rng(0).normal(0, 0.1, (60 * RATE, 2)).astype(np.float32)
-    out, v = build(song, song * 0.5, beats, 8.1)
-    assert v == 16 and len(out) == len(song) - 8 * RATE + 32 * RATE, (v, len(out))
+    out, k = build(song, song * 0.5, beats, 7.6)  # vocal on beat 15 -> beat taken from beat 16 (bar 5)
+    assert k == 16 and len(out) == 32 * RATE + len(song), (k, len(out))
+    assert np.array_equal(out[32 * RATE:], song)  # the original plays untouched after the 16 bars
+    assert abs(rms(out[RATE:32 * RATE]) / rms(song[8 * RATE:40 * RATE]) - 1) < 0.05  # as loud as the song
+    loud = limit(song * 20)
+    assert np.abs(loud).max() <= 0.98 + 1e-6
     vox = np.zeros(30 * RATE, np.float32)
     vox[10 * RATE:] = np.sin(np.arange(20 * RATE) * 0.05)
     assert abs(vocal_start(vox, 0.5) - 10) < 0.2
@@ -101,6 +129,6 @@ if __name__ == "__main__":
     mixed, v = build(audio, nv, beats, start)
     if mixed is None:
         sys.exit("The vocal starts too late in this song to add an intro.")
-    print(f"Vocal starts at {start:.1f} s (beat {v + 1}). Writing the intro…", flush=True)
+    print(f"Vocal starts at {start:.1f} s. Writing the intro (beat from bar {v // 4 + 1})…", flush=True)
     es.AudioWriter(filename=str(out), format=out.suffix[1:], sampleRate=RATE)(np.ascontiguousarray(mixed, np.float32))
     print(f"Intro saved: {out.name}", flush=True)

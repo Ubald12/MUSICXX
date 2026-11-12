@@ -64,7 +64,7 @@ When it finishes, MUSICXX opens in its own window, and a **MUSICXX** shortcut ap
 - **Charts:** choose a genre, then download one song or all 100.
 - **Library:** search your songs, click a column to sort, ▶ to play. Click a song to highlight the songs that mix with it, then **Suggest a set**.
 - **Stems:** in the Library, click the ☰ button on a song. The first time, MUSICXX downloads the separation tool (about 1 GB).
-- **16-bar intro:** in the Library, click **+ 16-bar intro** on a song (or click the song, then **+ 16-bar intro** in the bar above the list). In about a minute, *Song (16 Bar Intro)* appears next to it: 16 bars of the song's beat with the vocals removed, then the song from where the vocal starts. Not available on Windows.
+- **16-bar intro:** in the Library, click **+ 16-bar intro** on a song (or click the song, then **+ 16-bar intro** in the bar above the list). In about a minute, *Song (16 Bar Intro)* appears next to it: 16 bars of the song's beat with the vocals removed, as loud as the song, then the whole original song from its normal start. Not available on Windows.
 - **Vocal outro:** click **+ Vocal outro** the same way. *Song (Vocal Outro)* plays normally, then its last 16 bars of singing are vocals only. You can do both on one song: make the intro, then a vocal outro of the intro version. Not available on Windows.
 - **DJ apps:** playlists are saved in **OK/Playlists**. In Rekordbox, go to **Preferences › Advanced › rekordbox xml** and choose *MUSICXX for Rekordbox.xml*; the playlists appear under "rekordbox xml". Serato gets MUSICXX crates automatically (restart Serato to see them).
 - **Phone:** in **Settings**, turn on **Send songs from my phone** and scan the QR code. Your phone must be on the same Wi-Fi.
