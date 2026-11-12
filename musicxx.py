@@ -185,11 +185,52 @@ def dl_format():
     return "wav" if settings["format"] == "aiff" else settings["format"]
 
 
+# spotdl's YouTube Music matching, replaced (run as `python -c SPOTDL_RUN download …`):
+# 1. it asks YouTube Music for German results, which current ytmusicapi can't read, so every song search came back
+#    empty and it fell back to random videos (live sessions, radio versions, lyric uploads). Use an English client.
+# 2. its filter drops the official song when Spotify lists more artists than YouTube Music ("A, B, C" vs "A").
+#    Our rule: same title, an artist in common, length within 5 s, and no live / remix / radio-version words that
+#    the Spotify title doesn't have. Together with --only-verified-results (YouTube Music songs, never videos).
+# shortcut: patches spotdl internals (YouTubeMusic._create_client, base.order_results); recheck on spotdl upgrades.
+SPOTDL_RUN = r"""
+import re, sys
+VERSIONS = {"live", "remix", "edit", "acoustic", "instrumental", "version", "sped", "slowed", "cover", "karaoke",
+            "radio", "session", "sessions", "freestyle", "skyrock", "planeterap", "planète", "extended", "reverb",
+            "nightcore", "mix", "clip", "lyrics", "paroles", "dub", "performance", "concert", "tiktok", "8d"}
+def words(s):
+    return set(re.findall(r"[\w']+", s.lower()))
+def core(s):
+    return " ".join(re.findall(r"\w+", re.sub(r"[(\[].*?[)\]]| - .*", "", s.lower())))
+def order(results, song, *_):
+    artists = [core(a) for a in song.artists]
+    out = {}
+    for r in results:
+        if r.duration and song.duration and abs(r.duration - song.duration) > 5:
+            continue
+        if core(r.name) != core(song.name) or (words(r.name) & VERSIONS) - words(song.name):
+            continue
+        theirs = [core(a) for a in r.artists or ()] + [core(r.name)]
+        if not any(a and (a in t or t in a) for a in artists for t in theirs if t):
+            continue
+        out[r] = 100 - 3 * abs((r.duration or song.duration) - song.duration) - (10 if song.explicit and r.explicit is False else 0)
+    return out
+if __name__ == "__main__":
+    import ytmusicapi, spotdl.providers.audio.base as base, spotdl.providers.audio.ytmusic as ytm
+    ytm.YouTubeMusic._create_client = staticmethod(lambda: ytmusicapi.YTMusic())
+    base.order_results = order
+    from spotdl.console import console_entry_point
+    sys.argv[0] = "spotdl"
+    console_entry_point()
+"""
+
+
 def spotdl(*queries, archive=None):
     """spotdl takes Spotify links or plain "Artist - Title" searches."""
     fmt = dl_format()
     # DEBUG log: shows whether spotdl matched the song by its recording code (ISRC) or by a best guess
-    return [*tool("spotdl", "spotdl"), "download", *queries, "--format", fmt, *(["--bitrate", "320k"] if fmt == "mp3" else []),
+    run = [sys.executable, "-c", SPOTDL_RUN] if importlib.util.find_spec("spotdl") else ["spotdl"]
+    # only YouTube Music *songs* (the official releases), never videos; nothing found -> the job's YouTube Music fallback
+    return [*run, "download", *queries, "--only-verified-results", "--format", fmt, *(["--bitrate", "320k"] if fmt == "mp3" else []),
             "--simple-tui", "--log-level", "DEBUG", *(["--archive", str(archive)] if archive else []),
             "--output", f"{OUT}/{{artists}} - {{title}}.{{output-ext}}"]
 
@@ -1889,6 +1930,14 @@ def self_update():
 
 def self_test():
     assert command("hello") is None
+    match = {}  # the strict YouTube Music matcher spotdl runs with
+    exec(SPOTDL_RUN.replace('__name__ == "__main__"', "False"), match)
+    R = lambda name, artists, dur, explicit=None: type("R", (), dict(name=name, artists=artists, duration=dur, explicit=explicit))()
+    song = type("S", (), dict(name="Mopao aye", artists=["TRIANGLE DES BERMUDES", "MC YOSHI", "Mauvais djo"], duration=199, explicit=False))()
+    hits = match["order"]([R("Mopao aye (feat. MC YOSHI, Mauvais Djo & Kokosvoice)", ["Triangle des bermudes"], 199),
+                           R("MOPAO AYE #PlanèteRap", ["SkyrockFM"], 204), R("Mopao aye (Live)", ["Triangle des bermudes"], 200),
+                           R("Balek", ["Triangle des bermudes"], 199), R("Mopao aye", ["Someone Else"], 199)], song)
+    assert [r.name for r in hits] == ["Mopao aye (feat. MC YOSHI, Mauvais Djo & Kokosvoice)"], hits
     sp = command("https://open.spotify.com/playlist/abc")
     assert "download" in sp and sp[-1] == f"{OUT}/{{artists}} - {{title}}.{{output-ext}}"
     yt = command("https://soundcloud.com/a/sets/b")
