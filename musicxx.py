@@ -33,7 +33,8 @@ def save(name, data):
     tmp.replace(DATA / name)  # atomic: a crash mid-write never leaves half a file
 
 
-settings = {"folder": str(DEFAULT_OUT), "format": "wav", "open_when_done": False, "clipboard": True, **load("settings.json", {})}
+settings = {"folder": str(DEFAULT_OUT), "format": "wav", "open_when_done": False, "clipboard": True, "edits": [],
+            **load("settings.json", {})}  # edits: DJ edits made to every download ("intro", "outro")
 OUT = Path(settings["folder"])  # every song lands here, flat
 LOGO = Path(__file__).with_name("logo.png")
 # Tools: this Python's own bin/Scripts folder (installer setup), the ffmpeg spotdl downloads, then Homebrew/pipx
@@ -505,6 +506,8 @@ def analyzer():
                 f, name = tidy(job, name, f)
             if job and settings["format"] == "aiff" and f.suffix == ".wav":
                 f = to_aiff(f)
+            if job and job.get("edits"):
+                f, name = apply_edits(job, name, f)
             r = subprocess.run([str(VENV_PY), "-I", str(ANALYZER), str(f)], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
             result = json.loads(r.stdout.strip().splitlines()[-1])
         except Exception:
@@ -618,6 +621,10 @@ def run(job):
         code = execute(job, job["cmd"])
     if job.get("intro") and code == 0 and Path(job["intro"]).is_file():
         out = Path(job["intro"])
+        if job.get("source"):  # the edit replaces the song: one version only
+            Path(job["source"]).unlink(missing_ok=True)
+            with lib_lock:
+                library.pop(Path(job["source"]).stem, None)
         job["songs"].append(out.stem)
         job["saved"] = 1
         queue_analysis(job, out.stem, str(out))
@@ -655,7 +662,8 @@ MAX_PARALLEL = 2  # downloads at once; the rest wait their turn (a 100-song char
 def start(url, cmd, **extra):
     """Add a download to the queue."""
     job = {"id": next(ids), "url": url, "cmd": cmd, "status": "queued", "saved": 0, "songs": [], "total": 0,
-           "pct": 0, "info": {}, "log": "Waiting for other downloads to finish…", **extra}
+           "pct": 0, "info": {}, "log": "Waiting for other downloads to finish…",
+           **({} if "stems" in extra or "intro" in extra else {"edits": list(settings["edits"])}), **extra}
     if not cmd:
         job.update(status="failed", log="That's not a link I can download.")
     jobs.append(job)
@@ -743,6 +751,9 @@ def export_all():
     return {"folder": str(out_dir), "playlists": len(lists), "serato": serato.is_dir()}
 
 
+DEMUCS_PIP = [sys.executable, "-m", "pip", "install", *PIP_USER, "demucs", "torch<2.9", "torchaudio<2.9", "soundfile"]
+
+
 def demucs_song(name):
     """(song file, pip command that installs Demucs first or None), or None if that can't work here."""
     n = Path(name)  # the page sends the file name; song_file wants it without the extension
@@ -752,7 +763,7 @@ def demucs_song(name):
     if importlib.util.find_spec("demucs"):
         return f, None
     # torch/torchaudio < 2.9: newer torchaudio can't save audio without an extra library
-    return (f, [sys.executable, "-m", "pip", "install", "demucs", "torch<2.9", "torchaudio<2.9", "soundfile"]) if OWN_PYTHON else None
+    return (f, DEMUCS_PIP) if OWN_PYTHON else None
 
 
 def stems(name):
@@ -770,29 +781,64 @@ INTRO = Path(__file__).with_name("intro.py")
 EDITS = {"intro": "16 Bar Intro", "outro": "Vocal Outro"}
 
 
+def have_intro():
+    """intro.py is here (installs older than this feature only self-update the files they knew about)."""
+    if INTRO.is_file():
+        return True
+    try:
+        code = fetch(f"https://raw.githubusercontent.com/{REPO}/main/intro.py")
+        compile(code, "intro.py", "exec")
+        if not code.strip():  # offline
+            return False
+        INTRO.write_text(code, encoding="utf-8")
+        return True
+    except (SyntaxError, ValueError, OSError):
+        return False
+
+
+def edit_name(f, kinds):
+    return f.with_name(f.stem + "".join(f" ({EDITS[k]})" for k in kinds) + f.suffix)
+
+
+def apply_edits(job, name, f):
+    """The DJ edits chosen at download, made in place: the plain file is replaced by "<song> (16 Bar Intro)" etc.,
+    so there is only ever one version. Returns (file, name) to use from now on; the plain file if it can't be done."""
+    kinds = [k for k in EDITS if k in job.get("edits", ()) and f"({EDITS[k]})" not in f.stem]
+    if not kinds or not VENV_PY.exists() or not have_intro():
+        return f, name
+    if not importlib.util.find_spec("demucs"):
+        if not OWN_PYTHON:
+            return f, name
+        set_info(job, name, state="editing")
+        subprocess.run(DEMUCS_PIP, capture_output=True)
+        importlib.invalidate_caches()
+    set_info(job, name, state="editing")
+    out = edit_name(f, kinds)
+    r = subprocess.run([str(VENV_PY), "-I", str(INTRO), str(f), str(out), sys.executable, "+".join(kinds)],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=1800)
+    if r.returncode or not out.is_file():
+        set_info(job, name, state="analyzing", edit_error=(r.stderr.strip().splitlines() or ["Couldn't make the DJ edit."])[-1][-200:])
+        return f, name
+    f.unlink()
+    rename_song(job, name, out.stem)
+    set_info(job, out.stem, state="analyzing")
+    return out, out.stem
+
+
 def add_intro(name, kind="intro"):
-    """A DJ version: "intro" = 16 bars of the song's own beat before the vocal, saved as "<song> (16 Bar Intro)";
-    "outro" = the last 16 bars with singing as isolated vocals, saved as "<song> (Vocal Outro)"."""
-    if kind not in EDITS:
+    """Library button: replace a song with its DJ edit. "intro" = 16 bars of the song's own beat before the vocal,
+    saved as "<song> (16 Bar Intro)"; "outro" = the last 16 bars with singing as isolated vocals, "(Vocal Outro)"."""
+    if kind not in EDITS or not have_intro():
         return None
-    if not INTRO.is_file():  # installs older than this feature only self-update the files they knew about
-        try:
-            code = fetch(f"https://raw.githubusercontent.com/{REPO}/main/intro.py")
-            compile(code, "intro.py", "exec")
-            if not code.strip():  # offline
-                return None
-            INTRO.write_text(code, encoding="utf-8")
-        except (SyntaxError, ValueError, OSError):
-            return None
     found = demucs_song(name)
     if not found or not VENV_PY.exists():  # needs essentia for the beat grid (not on Windows)
         return None
     f, pre = found
     if f"({EDITS[kind]})" in f.stem:
         return None
-    out = f.with_name(f"{f.stem} ({EDITS[kind]}){f.suffix}")
+    out = edit_name(f, [kind])
     return start(f"{EDITS[kind]} · {f.stem}", [str(VENV_PY), "-I", str(INTRO), str(f), str(out), sys.executable, kind],
-                 intro=str(out), kind=kind, pre=pre)
+                 intro=str(out), source=str(f), kind=kind, pre=pre)
 
 
 def notify(title, text):
@@ -1039,7 +1085,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(json.dumps({"renamed": tidy_library()}))
         if self.path == "/retry" and job and job["status"] in ("failed", "cancelled"):
             new = start(job["url"], command(job["url"]) or job["cmd"],
-                        **{k: job[k] for k in ("chart", "shazam", "cover", "retry", "total", "sync", "stems", "intro", "kind", "pre") if k in job})
+                        **{k: job[k] for k in ("chart", "shazam", "cover", "retry", "total", "sync", "stems", "intro", "source", "kind", "edits", "pre") if k in job})
             return self.send(json.dumps([new["id"]]))
         if self.path == "/settings":
             return self.send(json.dumps(update_settings(body)))
@@ -1097,6 +1143,8 @@ def update_settings(body):
     for k in ("open_when_done", "clipboard"):
         if isinstance(body.get(k), bool):
             settings[k] = body[k]
+    if isinstance(body.get("edits"), list):
+        settings["edits"] = [k for k in EDITS if k in body["edits"]]
     if isinstance(body.get("phone"), bool):
         settings["phone"] = body["phone"]
         phone(body["phone"])
@@ -1345,6 +1393,7 @@ main{flex:1;overflow-y:auto}main:focus,#charts:focus,#explore:focus{outline:none
 .more{font-size:12.5px;color:var(--red);padding:6px 4px}
 .actions{display:flex;gap:8px;margin-top:10px}
 .pill{display:inline-flex;align-items:center;gap:6px;padding:6px 11px;border-radius:6px;font-size:13px;font-weight:500;background:var(--bg2);color:var(--text)}.pill:hover{background:var(--hover);box-shadow:inset 0 0 0 1px var(--line)}
+.edits{display:inline-flex;gap:4px}.edits .pill{white-space:nowrap}.edits .pill.on{background:var(--text);color:var(--bg)}.edits .pill.on::before{content:"✓"}
 footer{padding:10px 18px 16px;border-top:1px solid #15171a;background:var(--metal);box-shadow:inset 0 1px rgba(255,255,255,.08)}
 #f{max-width:760px;margin:0 auto;display:flex;align-items:center;gap:8px;padding:5px;border-radius:8px;background:#1a1c1f;border:1px solid var(--line)}
 #f:focus-within{border-color:var(--muted)}
@@ -1524,7 +1573,7 @@ nav button{padding:5px 9px}.grid{grid-template-columns:repeat(2,1fr);gap:10px}#p
 <button class="ico" id="pdl" title="Download"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12M6 11l6 6 6-6M5 20h14"/></svg></button><a class="ico" id="popen" target="_blank" rel="noopener" title="Open on the site"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg></a><button class="ico" id="px" title="Close (Esc)"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><div id="pframe"></div></div>
 <div id="toast" role="status"></div>
 <footer><form id="f"><span id="detect"></span><textarea id="t" rows="1" placeholder="Paste a Spotify, YouTube or SoundCloud link…" aria-label="Links"></textarea>
-<button type="button" class="pill" data-listen title="Listen to a song playing near you and download it"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>Listen</button><button type="button" class="pill" id="paste">Paste</button><button class="send" id="go" disabled><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12M6 11l6 6 6-6M5 20h14"/></svg>Download</button></form>
+<button type="button" class="pill" data-listen title="Listen to a song playing near you and download it"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>Listen</button><button type="button" class="pill" id="paste">Paste</button><span class="edits" role="group" aria-label="DJ edits for downloads"><button type="button" class="pill" data-edit="intro" aria-pressed="false" title="Give every song you download 16 bars of its own beat before the vocal">16-bar intro</button><button type="button" class="pill" data-edit="outro" aria-pressed="false" title="Make the last 16 bars with singing of every song you download vocals only">Vocal outro</button></span><button class="send" id="go" disabled><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12M6 11l6 6 6-6M5 20h14"/></svg>Download</button></form>
 <div class="hint">Enter to download · paste several links at once · or drag a link anywhere</div></footer>
 <div id="drop"><div>Drop the link to download</div></div>
 <div id="clip" role="alert"><b>Copied link</b><span id="clipk"></span><span class="u" id="clipu"></span><button class="send" id="clipgo"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12M6 11l6 6 6-6M5 20h14"/></svg>Download</button><button class="ico" id="clipx" title="Dismiss"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>
@@ -1582,12 +1631,13 @@ function card(j){
 }
 function tags(i){  // key / BPM / genre for one song
   if(!i)return'';
-  if(i.state!='done')return`<div class="tags"><b class="tag wait">${i.state=='analyzing'?'Analyzing key & BPM…':'Waiting to analyze…'}</b></div>`;
+  if(i.state!='done')return`<div class="tags"><b class="tag wait">${i.state=='editing'?'Adding DJ edit (about a minute)…':i.state=='analyzing'?'Analyzing key & BPM…':'Waiting to analyze…'}</b></div>`;
   const t=[];
   if(i.camelot)t.push(`<b class="tag cam" style="--h:${(parseInt(i.camelot)-1)*30}" title="Camelot key">${esc(i.camelot)}</b>`,`<b class="tag" title="Key">${esc(i.key)}</b>`);
   if(i.bpm)t.push(`<b class="tag" title="Tempo (estimate)">${i.bpm} BPM</b>`);
   if(i.genre)t.push(`<b class="tag gen" title="Genre">${esc(i.genre)}</b>`);
   const m=matchTag(i.match);if(m)t.push(m);
+  if(i.edit_error)t.push(`<b class="tag warn" title="${esc(i.edit_error)}">No DJ edit: ${esc(i.edit_error)}</b>`);
   if(i.duplicate)t.push('<b class="tag warn" title="This song was already in your folder, so the new copy was removed">Already in your library</b>');
   return`<div class="tags">${t.join('')||'<b class="tag">Couldn\'t analyze this one</b>'}</div>`}
 function matchTag(m){  // how sure we are this is the same recording as on Spotify
@@ -1769,7 +1819,7 @@ function renderLib(){
   $('lrows').innerHTML=rows.map(s=>`<tr data-row="${esc(s.file)}" class="${lplaying==s.file?'playing ':''}${A?(s==A?'anchor':mixes(A,s)?'mix':'dim'):''}" title="Click to see which songs mix with this one"><td><div class="tt">${s.cover?`<img src="${esc(small(s.cover))}" alt="" loading="lazy">`:'<span class="ph0"></span>'}<div style="min-width:0"><b>${esc(s.title)}</b><span>${esc(s.artist)}${s.dup?' · <span style="color:#ff9f0a">duplicate?</span>':''}</span></div></div></td>
   <td>${s.camelot?`<b class="tag cam" style="--h:${(parseInt(s.camelot)-1)*30}">${esc(s.camelot)}</b> <span class="mut">${esc(s.key)}</span>`:s.state=='analyzing'?'<span class="mut">Analyzing…</span>':''}</td>
   <td class="num" title="${s.lufs!=null?'Loudness '+s.lufs+' LUFS':''}">${s.bpm||''}</td><td class="mut">${esc(s.genre||'')}</td><td class="mut">${esc(s.ext)}</td><td class="mut num">${new Date(s.added*1000).toLocaleDateString()}</td>
-  <td class="acts">${/\(16 Bar Intro\)/.test(s.name)?'':`<button class="pill sm" data-lintro="${esc(s.file)}" title="Make a DJ version with 16 bars of beat before the vocal">+ 16-bar intro</button>`}${/\(Vocal Outro\)/.test(s.name)?'':`<button class="pill sm" data-loutro="${esc(s.file)}" title="Make a DJ version whose last 16 bars with singing are the vocals only">+ Vocal outro</button>`}<button class="ico" data-lstems="${esc(s.file)}" title="Split into vocals, drums, bass and other">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h10M4 17h6"/></svg>'}</button><button class="ico" data-lplay="${esc(s.file)}" title="Play">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4l13 8-13 8z"/></svg>'}</button><button class="ico" data-lshow="${esc(s.name)}" title="Show in folder">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>'}</button></td></tr>`).join('')}
+  <td class="acts">${/\(16 Bar Intro\)/.test(s.name)?'':`<button class="pill sm" data-lintro="${esc(s.file)}" title="Replace this song with a version that has 16 bars of beat before the vocal">+ 16-bar intro</button>`}${/\(Vocal Outro\)/.test(s.name)?'':`<button class="pill sm" data-loutro="${esc(s.file)}" title="Replace this song with a version whose last 16 bars with singing are vocals only">+ Vocal outro</button>`}<button class="ico" data-lstems="${esc(s.file)}" title="Split into vocals, drums, bass and other">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h10M4 17h6"/></svg>'}</button><button class="ico" data-lplay="${esc(s.file)}" title="Play">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4l13 8-13 8z"/></svg>'}</button><button class="ico" data-lshow="${esc(s.name)}" title="Show in folder">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>'}</button></td></tr>`).join('')}
 $('lq').oninput=renderLib;
 document.querySelector('.ltab thead').onclick=e=>{const th=e.target.closest('th[data-s]');if(!th)return;
   if(lsort==th.dataset.s)lasc=!lasc;else{lsort=th.dataset.s;lasc=/title|genre|camelot|ext/.test(lsort)}renderLib()};
@@ -1800,7 +1850,7 @@ $('mixset').onclick=()=>{  // greedy: from the chosen song, always step to the c
   $('setlist').classList.add('show');$('setsave').hidden=set.length<2;if(set.length<2)$('setol').innerHTML='<li>No other song mixes with this one yet.</li>'};
 $('setsave').onclick=async()=>{const r=await post('/save-set',{songs:set.map(s=>s.name)});toast(r.ok?'Set saved: it\'s in the DJ-app playlists':'Couldn\'t save the set')};
 // ---- Settings
-function applyCfg(c){cfg=c;
+function applyCfg(c){cfg=c;document.querySelectorAll('[data-edit]').forEach(b=>{const on=(c.edits||[]).includes(b.dataset.edit);b.classList.toggle('on',on);b.setAttribute('aria-pressed',on)});
   document.querySelectorAll('.where').forEach(e=>e.textContent=where());document.querySelectorAll('.fmt').forEach(e=>e.textContent='.'+cfg.format);
   $('sfolder').value=cfg.folder;$('sformat').value=cfg.format;$('sopen').checked=cfg.open_when_done;$('sclip').checked=cfg.clipboard;
   $('ssyncs').innerHTML=cfg.syncs.length?cfg.syncs.map(e=>`<li>${chip(kind(e.url))}<span title="${esc(e.url)}">${esc(short(e.url))}</span><small>${e.last?'checked '+new Date(e.last*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}):''}</small><button class="pill" data-unsync="${esc(e.url)}">Stop</button></li>`).join('')+
@@ -1808,6 +1858,9 @@ function applyCfg(c){cfg=c;
   for(const id in last)delete last[id];poll()}  // re-render cards (folder name, sync buttons)
 const saveCfg=async b=>applyCfg(await (await post('/settings',b)).json());
 fetch('/settings').then(r=>r.json()).then(applyCfg).catch(()=>{});
+document.querySelectorAll('[data-edit]').forEach(b=>b.onclick=async()=>{const k=b.dataset.edit,e=new Set(cfg.edits||[]);e.has(k)?e.delete(k):e.add(k);
+  applyCfg(await (await post('/settings',{edits:[...e]})).json());
+  toast(e.size?`Songs you download will get: ${[...e].map(x=>x=='intro'?'16-bar intro':'vocal outro').join(' + ')}`:'Songs download as they are')});
 $('gear').onclick=()=>{$('settings').classList.add('show');$('sfolder').focus();showPhone()};
 $('setx').onclick=()=>$('settings').classList.remove('show');
 $('settings').onclick=e=>{if(e.target.id=='settings')$('setx').click()};

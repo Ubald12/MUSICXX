@@ -1,7 +1,7 @@
 """DJ edits of a song: a 16-bar intro (16 bars of its own beat, vocals removed, before the vocal comes in) or a
 vocal outro (the last 16 bars with singing play as the isolated vocals, then the song ends).
 Runs in the Python that has essentia; Demucs runs in the Python given as the third argument.
-Usage: python intro.py song.wav "song (16 Bar Intro).wav" /path/to/python-with-demucs [intro|outro]"""
+Usage: python intro.py song.wav "song (16 Bar Intro).wav" /path/to/python-with-demucs [intro|outro|intro+outro]"""
 import subprocess, sys, tempfile
 from pathlib import Path
 import numpy as np
@@ -98,7 +98,7 @@ def check():
 if __name__ == "__main__":
     check()
     song, out, demucs_py = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
-    mode = sys.argv[4] if len(sys.argv) > 4 else "intro"
+    modes = (sys.argv[4] if len(sys.argv) > 4 else "intro").split("+")  # "intro", "outro" or "intro+outro"
     audio, rate = es.AudioLoader(filename=str(song))()[:2]
     if rate != RATE:
         audio = np.stack([es.Resample(inputSampleRate=rate, outputSampleRate=RATE)(np.ascontiguousarray(audio[:, c]))
@@ -117,18 +117,20 @@ if __name__ == "__main__":
     start = vocal_start(mono, beat)
     if start is None:
         sys.exit("No vocals found in this song.")
-    if mode == "outro":
-        end = n / RATE - vocal_start(mono[::-1], beat)
-        mixed = outro(audio, vocals[:n], beats, end)
+    end = n / RATE - vocal_start(mono[::-1], beat)
+    vocals = vocals[:n]
+    if "intro" in modes:
+        mixed, v = build(audio, nv, beats, start)
         if mixed is None:
+            sys.exit("The vocal starts too late in this song to add an intro.")
+        print(f"Vocal starts at {start:.1f} s. Intro beat from bar {v // 4 + 1}.", flush=True)
+        shift = len(mixed) - n  # everything after the intro moved this far: keep vocals and beats lined up with it
+        audio, vocals = mixed, np.concatenate([np.zeros((shift, vocals.shape[1]), np.float32), vocals])
+        beats, end = beats + shift / RATE, end + shift / RATE
+    if "outro" in modes:
+        audio = outro(audio, vocals, beats, end)
+        if audio is None:
             sys.exit("The vocals in this song are too short for a 16-bar outro.")
-        print(f"Vocals end at {end:.1f} s. Writing the vocal outro…", flush=True)
-        es.AudioWriter(filename=str(out), format=out.suffix[1:], sampleRate=RATE)(np.ascontiguousarray(mixed, np.float32))
-        print(f"Outro saved: {out.name}", flush=True)
-        sys.exit()
-    mixed, v = build(audio, nv, beats, start)
-    if mixed is None:
-        sys.exit("The vocal starts too late in this song to add an intro.")
-    print(f"Vocal starts at {start:.1f} s. Writing the intro (beat from bar {v // 4 + 1})…", flush=True)
-    es.AudioWriter(filename=str(out), format=out.suffix[1:], sampleRate=RATE)(np.ascontiguousarray(mixed, np.float32))
-    print(f"Intro saved: {out.name}", flush=True)
+        print(f"Vocals end at {end:.1f} s. Vocal outro added.", flush=True)
+    es.AudioWriter(filename=str(out), format=out.suffix[1:], sampleRate=RATE)(np.ascontiguousarray(audio, np.float32))
+    print(f"Saved: {out.name}", flush=True)
