@@ -34,7 +34,7 @@ for f in pathlib.Path(sys.argv[1]).iterdir():
 PYFIX
 
 echo "== App"
-cp musicxx.py analyze.py logo.png "$R/app/"
+cp musicxx.py analyze.py intro.py logo.png "$R/app/"
 cp MUSICXX.icns "$R/MUSICXX.icns"
 clang -O2 -mmacosx-version-min=11.0 -o "$APP/Contents/MacOS/MUSICXX" packaging/launcher.c \
   -I"$R/python/include/python3.12" -L"$R/python/lib" -lpython3.12 -Wl,-rpath,@executable_path/../Resources/python/lib

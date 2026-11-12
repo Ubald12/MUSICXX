@@ -19,6 +19,7 @@ if not defined PY (
 if not exist "%DIR%\app" mkdir "%DIR%\app"
 copy /y musicxx.py "%DIR%\app\" >nul
 copy /y analyze.py "%DIR%\app\" >nul
+copy /y intro.py "%DIR%\app\" >nul
 copy /y logo.png "%DIR%\app\" >nul
 copy /y logo.ico "%DIR%\app\" >nul
 %PY% -m venv "%DIR%\venv" || goto fail

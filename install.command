@@ -19,7 +19,7 @@ fi
 echo "== Using $("$PY" --version)"
 
 mkdir -p "$DIR/app"
-cp musicxx.py analyze.py logo.png MUSICXX.icns mac_launch.sh "$DIR/app/"
+cp musicxx.py analyze.py intro.py logo.png MUSICXX.icns mac_launch.sh "$DIR/app/"
 "$PY" -m venv "$DIR/venv"
 V="$DIR/venv/bin"
 "$V/python" -m pip install -q --upgrade pip

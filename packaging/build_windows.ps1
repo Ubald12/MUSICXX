@@ -19,7 +19,7 @@ $env:USERPROFILE = (New-Item -ItemType Directory -Force build/home).FullName
 $env:USERPROFILE = $realHome
 Copy-Item build/home/.spotdl/ffmpeg.exe build/python/
 Remove-Item -Recurse -Force build/home
-Copy-Item musicxx.py, analyze.py, logo.png, logo.ico build/app/
+Copy-Item musicxx.py, analyze.py, intro.py, logo.png, logo.ico build/app/
 & $P build/app/musicxx.py --test; if ($LASTEXITCODE) { exit 1 }
 $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
 if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }

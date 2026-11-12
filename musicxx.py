@@ -414,7 +414,7 @@ def clean_name(stem):
 def song_key(stem):
     """Same song regardless of features, brackets, case and punctuation: used to spot duplicates."""
     artist, _, title = stem.partition(" - ")
-    title = re.sub(r"[(\[].*?[)\]]|\bfeat\..*", "", title or artist)
+    title = re.sub(r"[(\[](?!16 Bar Intro).*?[)\]]|\bfeat\..*", "", title or artist)  # an intro edit isn't a duplicate
     return re.sub(r"\W+", "", re.split(r",|&| x | feat", artist)[0].lower()) + "|" + re.sub(r"\W+", "", title.lower())
 
 
@@ -575,8 +575,13 @@ def run(job):
     code = execute(job, job["pre"]) if job.get("pre") else 0  # e.g. installing the stem-separation library first
     if code == 0 and not job.get("cancelled"):
         code = execute(job, job["cmd"])
+    if job.get("intro") and code == 0 and Path(job["intro"]).is_file():
+        out = Path(job["intro"])
+        job["songs"].append(out.stem)
+        job["saved"] = 1
+        queue_analysis(job, out.stem, str(out))
     retry = job.get("retry")  # a prepared second try (recognized songs), else the per-link fallback
-    if not job.get("cancelled") and not job["saved"] and not job.get("stems") and (retry or can_fallback(job["url"], job["log"])):
+    if not job.get("cancelled") and not job["saved"] and not job.get("stems") and not job.get("intro") and (retry or can_fallback(job["url"], job["log"])):
         job["log"] = ("Trying YouTube Music…" if retry else
                       f"{'Spotify' if 'spotify' in job['url'] else 'SoundCloud'} won't give this song. Getting it from YouTube Music…")
         job["fallback"] = True
@@ -697,20 +702,41 @@ def export_all():
     return {"folder": str(out_dir), "playlists": len(lists), "serato": serato.is_dir()}
 
 
-def stems(name):
-    """Split a song into vocals / drums / bass / other with Demucs, into <folder>/Stems/htdemucs/<song>/."""
+def demucs_song(name):
+    """(song file, pip command that installs Demucs first or None), or None if that can't work here."""
     n = Path(name)  # the page sends the file name; song_file wants it without the extension
     f = song_file(n.stem if n.suffix.lower() in AUDIO else n.name)
     if not f:
         return None
-    pre = None
-    if not importlib.util.find_spec("demucs"):
-        if not OWN_PYTHON:
-            return None
-        # torch/torchaudio < 2.9: newer torchaudio can't save audio without an extra library
-        pre = [sys.executable, "-m", "pip", "install", "demucs", "torch<2.9", "torchaudio<2.9", "soundfile"]
+    if importlib.util.find_spec("demucs"):
+        return f, None
+    # torch/torchaudio < 2.9: newer torchaudio can't save audio without an extra library
+    return (f, [sys.executable, "-m", "pip", "install", "demucs", "torch<2.9", "torchaudio<2.9", "soundfile"]) if OWN_PYTHON else None
+
+
+def stems(name):
+    """Split a song into vocals / drums / bass / other with Demucs, into <folder>/Stems/htdemucs/<song>/."""
+    if not (found := demucs_song(name)):
+        return None
+    f, pre = found
     return start(f"Stems · {f.stem}", [sys.executable, "-m", "demucs", "-n", "htdemucs", "-o", str(OUT / "Stems"),
                                        "--filename", "{track}/{stem}.{ext}", str(f)], stems=f.stem, pre=pre)
+
+
+INTRO = Path(__file__).with_name("intro.py")
+
+
+def add_intro(name):
+    """A DJ version with 16 bars of the song's own beat before the vocal, saved as "<song> (16 Bar Intro)"."""
+    found = demucs_song(name)
+    if not found or not VENV_PY.exists() or not INTRO.is_file():  # needs essentia for the beat grid (not on Windows)
+        return None
+    f, pre = found
+    if f.stem.endswith("(16 Bar Intro)"):
+        return None
+    out = f.with_name(f"{f.stem} (16 Bar Intro){f.suffix}")
+    return start(f"16-bar intro · {f.stem}", [str(VENV_PY), "-I", str(INTRO), str(f), str(out), sys.executable],
+                 intro=str(out), pre=pre)
 
 
 def notify(title, text):
@@ -941,6 +967,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/stems":
             job = stems(str(body.get("name", "")))
             return self.send(json.dumps({"job": job["id"]} if job else {"error": "unavailable"}), code=200 if job else 400)
+        if self.path == "/intro":
+            job = add_intro(str(body.get("name", "")))
+            return self.send(json.dumps({"job": job["id"]} if job else {"error": "unavailable"}), code=200 if job else 400)
         if self.path == "/export":
             return self.send(json.dumps(export_all()))
         if self.path == "/save-set":  # a set built in the Library's mixing helper
@@ -954,7 +983,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(json.dumps({"renamed": tidy_library()}))
         if self.path == "/retry" and job and job["status"] in ("failed", "cancelled"):
             new = start(job["url"], command(job["url"]) or job["cmd"],
-                        **{k: job[k] for k in ("chart", "shazam", "cover", "retry", "total", "sync", "stems", "pre") if k in job})
+                        **{k: job[k] for k in ("chart", "shazam", "cover", "retry", "total", "sync", "stems", "intro", "pre") if k in job})
             return self.send(json.dumps([new["id"]]))
         if self.path == "/settings":
             return self.send(json.dumps(update_settings(body)))
@@ -1475,7 +1504,7 @@ function card(j){
   const n=j.saved,k=kind(j.url);let head,bar='',meta='';
   if(j.status=='queued')head=`<span class="cancelled">Waiting in line…</span><button class="ico x" data-cancel="${j.id}" title="Remove from the queue">${X}</button>`,meta=esc(j.log||'');
   else if(j.status=='running'){
-    head=`<span class="spin"></span>${j.stems?'Separating stems…':'Downloading…'}<button class="ico x" data-cancel="${j.id}" title="Cancel">${X}</button>`;
+    head=`<span class="spin"></span>${j.stems?'Separating stems…':j.intro?'Adding a 16-bar intro…':'Downloading…'}<button class="ico x" data-cancel="${j.id}" title="Cancel">${X}</button>`;
     const p=j.total?Math.min(100,n/j.total*100):j.pct;
     bar=`<div class="bar ${p?'':'indef'}"><i style="width:${p}%"></i></div>`;
     meta=(j.total?`${n} / ${j.total} songs`:j.pct?`${j.pct.toFixed(0)}%`:'')+(j.log?' · '+esc(j.log):'');
@@ -1485,7 +1514,7 @@ function card(j){
   else{head=`<span class="failed">✕ Couldn't download${n?' everything ('+plural(n)+' saved)':''}</span>`;meta=esc(j.log)}
   const all=open.has(j.id),list=all?j.songs:j.songs.slice(-5);
   const cover=j.cover||Object.values(j.info||{}).map(i=>i.cover).find(Boolean);
-  const src=`<div class="src">${cover?`<img class="cv" src="${esc(small(cover))}" alt="">`:''}${j.stems?'<span class="chip">Stems</span>':j.shazam?'<span class="chip shz"><i></i>Identified by Shazam</span>':j.chart?'<span class="chip ch">Chart</span>':chip(k)}${j.sync?'<span class="chip syn"><i></i>Synced playlist</span>':''}</div>`;
+  const src=`<div class="src">${cover?`<img class="cv" src="${esc(small(cover))}" alt="">`:''}${j.stems?'<span class="chip">Stems</span>':j.intro?'<span class="chip">16-bar intro</span>':j.shazam?'<span class="chip shz"><i></i>Identified by Shazam</span>':j.chart?'<span class="chip ch">Chart</span>':chip(k)}${j.sync?'<span class="chip syn"><i></i>Synced playlist</span>':''}</div>`;
   const songs=list.length?`<ul class="songs">${list.map(s=>`<li><button data-song="${esc(s)}">${j.info&&j.info[s]&&j.info[s].cover?`<img src="${esc(small(j.info[s].cover))}" alt="">`:'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>'}<span>${esc(s)}</span><em>Show file</em></button>${tags(j.info&&j.info[s])}</li>`).join('')}</ul>`+
     (j.songs.length>5?`<button class="more" data-more="${j.id}">${all?'Show less':'Show all '+j.songs.length}</button>`:''):'';
   const pl=k&&/Playlist|Album/.test(k[2])&&!j.chart,on=cfg.syncs.some(e=>e.url==j.url);
@@ -1684,11 +1713,12 @@ function renderLib(){
   $('lrows').innerHTML=rows.map(s=>`<tr data-row="${esc(s.file)}" class="${lplaying==s.file?'playing ':''}${A?(s==A?'anchor':mixes(A,s)?'mix':'dim'):''}" title="Click to see which songs mix with this one"><td><div class="tt">${s.cover?`<img src="${esc(small(s.cover))}" alt="" loading="lazy">`:'<span class="ph0"></span>'}<div style="min-width:0"><b>${esc(s.title)}</b><span>${esc(s.artist)}${s.dup?' · <span style="color:#ff9f0a">duplicate?</span>':''}</span></div></div></td>
   <td>${s.camelot?`<b class="tag cam" style="--h:${(parseInt(s.camelot)-1)*30}">${esc(s.camelot)}</b> <span class="mut">${esc(s.key)}</span>`:s.state=='analyzing'?'<span class="mut">Analyzing…</span>':''}</td>
   <td class="num" title="${s.lufs!=null?'Loudness '+s.lufs+' LUFS':''}">${s.bpm||''}</td><td class="mut">${esc(s.genre||'')}</td><td class="mut">${esc(s.ext)}</td><td class="mut num">${new Date(s.added*1000).toLocaleDateString()}</td>
-  <td class="acts"><button class="ico" data-lstems="${esc(s.file)}" title="Split into vocals, drums, bass and other">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h10M4 17h6"/></svg>'}</button><button class="ico" data-lplay="${esc(s.file)}" title="Play">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4l13 8-13 8z"/></svg>'}</button><button class="ico" data-lshow="${esc(s.name)}" title="Show in folder">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>'}</button></td></tr>`).join('')}
+  <td class="acts">${/\(16 Bar Intro\)$/.test(s.name)?'':`<button class="ico" data-lintro="${esc(s.file)}" title="Make a DJ version with a 16-bar intro before the vocal">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h4M4 8v8M10 6v12M14 9v6M18 4v16"/></svg>'}</button>`}<button class="ico" data-lstems="${esc(s.file)}" title="Split into vocals, drums, bass and other">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h10M4 17h6"/></svg>'}</button><button class="ico" data-lplay="${esc(s.file)}" title="Play">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4l13 8-13 8z"/></svg>'}</button><button class="ico" data-lshow="${esc(s.name)}" title="Show in folder">${'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>'}</button></td></tr>`).join('')}
 $('lq').oninput=renderLib;
 document.querySelector('.ltab thead').onclick=e=>{const th=e.target.closest('th[data-s]');if(!th)return;
   if(lsort==th.dataset.s)lasc=!lasc;else{lsort=th.dataset.s;lasc=/title|genre|camelot|ext/.test(lsort)}renderLib()};
-$('lrows').onclick=e=>{const p=e.target.closest('[data-lplay]'),f=e.target.closest('[data-lshow]'),st=e.target.closest('[data-lstems]');
+$('lrows').onclick=e=>{const p=e.target.closest('[data-lplay]'),f=e.target.closest('[data-lshow]'),st=e.target.closest('[data-lstems]'),it=e.target.closest('[data-lintro]');
+  if(it){post('/intro',{name:it.dataset.lintro}).then(r=>r.ok?(tab(''),toast('Adding a 16-bar intro…'),poll()):toast('16-bar intros aren\'t available on this computer'));return}
   if(st){if(confirm('Split this song into vocals, drums, bass and other?\n\nTakes about a minute per song. The first time, MUSICXX also downloads the separation tool (about 1 GB).'))
     post('/stems',{name:st.dataset.lstems}).then(r=>r.ok?(tab(''),toast('Separating stems…'),poll()):toast('Stem separation isn\'t available on this computer'));return}
   if(!p&&!f){const r=e.target.closest('[data-row]');if(r){anchor=anchor==r.dataset.row?null:r.dataset.row;$('setlist').classList.remove('show');renderLib()}return}
@@ -1808,7 +1838,7 @@ REPO = "Ubald12/MUSICXX"
 
 
 def self_update():
-    """Replace musicxx.py/analyze.py with the latest from GitHub. True if anything changed.
+    """Replace musicxx.py/analyze.py/intro.py with the latest from GitHub. True if anything changed.
     Skipped in the git checkout, so it never overwrites work in progress."""
     here = Path(__file__).resolve().parent
     if (here / ".git").exists() or os.environ.get("MUSICXX_UPDATED"):
@@ -1825,7 +1855,7 @@ def self_update():
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         return False  # offline or rate-limited: run what we have
     changed = False
-    for name in ("musicxx.py", "analyze.py"):
+    for name in ("musicxx.py", "analyze.py", "intro.py"):
         new = fetch(f"https://raw.githubusercontent.com/{REPO}/{sha}/{name}")
         try:
             compile(new, name, "exec")  # never install a truncated or broken download
@@ -1864,6 +1894,7 @@ def self_test():
     assert clean_name("Gradur - GRADUR - DÉCENNIE (VIZUALISER)") == "Gradur - DÉCENNIE"
     assert clean_name("Tems - Free Mind (Official Video)") == "Tems - Free Mind" and clean_name("A - B (Remix)") == "A - B (Remix)"
     assert song_key("Victony, BNXN - WHO THIS (feat. BNXN)") == song_key("Victony - Who This")
+    assert song_key("A - B (16 Bar Intro)") != song_key("A - B")
     job = {"songs": [], "saved": 0, "total": 0, "pct": 0, "info": {}}
     for line in ["INFO Found 12 songs in My Mix (Playlist)", "DEBUG [x] Best ISRC result is https://y/1 with score 99",
                  "DEBUG Downloading A - B using https://y/1", "DEBUG [z] Returning best result https://y/2 with score 77",
